@@ -4,6 +4,10 @@ citeflex/unified_router.py
 Unified routing logic combining the best of CiteFlex Pro and Cite Fix Pro.
 
 Version History:
+    2025-12-10 V3.7: Added AI lookup for parenthetical citations (Author, Year).
+                     Uses OpenAI (gpt-4o) first, Claude fallback.
+                     Catches APA-style refs like (Simonton, 1992) and identifies
+                     the actual work via AI knowledge before database search.
     2025-12-06 16:00 V3.6: Added legal citation parser to recognize already-formatted
                            legal citations. Patterns: "Case v. Case, 388 U.S. 1 (1967)"
                            and UK neutral citations "[2024] UKSC 1". Properly formatted
@@ -72,6 +76,9 @@ from engines.famous_papers import find_famous_paper
 
 # Import Claude-first guess function
 from routers.claude import guess_and_search
+
+# Import AI lookup for parenthetical citations (Author, Year)
+from engines.ai_lookup import is_parenthetical_citation, lookup_parenthetical_citation
 
 # =============================================================================
 # AI ROUTER CONFIGURATION (Claude primary, Gemini fallback)
@@ -1763,12 +1770,20 @@ def _extract_from_url_path(url: str, citation_type: CitationType) -> Optional[Ci
 # MAIN ROUTING FUNCTION
 # =============================================================================
 
-def route_citation(query: str, style: str = "chicago") -> Tuple[Optional[CitationMetadata], str]:
+def route_citation(query: str, style: str = "chicago", author_date_mode: bool = False) -> Tuple[Optional[CitationMetadata], str]:
     """
     Main entry point: route query to appropriate engine and format result.
     
     Returns: (CitationMetadata, formatted_citation_string)
     
+    Args:
+        query: Citation text to process
+        style: Citation style (chicago, apa, mla, bluebook, oscola)
+        author_date_mode: If True, enables AI lookup for parenthetical citations
+                          like (Simonton, 1992). User must explicitly select this
+                          mode in the UI to avoid false matches in endnote documents.
+    
+    NEW (V3.7): Added author_date_mode for parenthetical citations.
     NEW (V3.4): Tries to parse already-formatted citations first.
     If the citation is complete (has author, title, journal/publisher, year),
     it reformats without searching databases. This preserves authoritative
@@ -1787,6 +1802,17 @@ def route_citation(query: str, style: str = "chicago") -> Tuple[Optional[Citatio
     if parsed and _is_citation_complete(parsed):
         print(f"[UnifiedRouter] Parsed complete citation: {parsed.citation_type.name}")
         return parsed, formatter.format(parsed)
+    
+    # 0.5. PARENTHETICAL CITATIONS: (Author, Year) format - use AI lookup
+    # Only enabled when user explicitly selects Author-Date mode in UI
+    # This prevents false matches on parenthetical asides in endnote documents
+    if author_date_mode and is_parenthetical_citation(query):
+        print(f"[UnifiedRouter] Author-Date mode: detected parenthetical citation: {query}")
+        paren_meta = lookup_parenthetical_citation(query)
+        if paren_meta and paren_meta.has_minimum_data():
+            print(f"[UnifiedRouter] AI identified: {paren_meta.title[:50]}...")
+            return paren_meta, formatter.format(paren_meta)
+        print("[UnifiedRouter] AI lookup failed, continuing to other methods...")
     
     # 1. Check for legal citation FIRST (legal.py handles famous cases)
     if legal.is_legal_citation(query):
@@ -2241,9 +2267,9 @@ def get_citation_options_formatted(query: str, style: str = "chicago", limit: in
 # =============================================================================
 
 # Alias for app.py compatibility
-def get_citation(query: str, style: str = "chicago") -> Tuple[Optional[CitationMetadata], str]:
+def get_citation(query: str, style: str = "chicago", author_date_mode: bool = False) -> Tuple[Optional[CitationMetadata], str]:
     """Alias for route_citation() - backward compatibility."""
-    return route_citation(query, style)
+    return route_citation(query, style, author_date_mode)
 
 
 def search_citation(query: str) -> List[dict]:
