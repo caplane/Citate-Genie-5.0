@@ -15,10 +15,10 @@ import json
 from typing import Optional, Dict, Any
 
 from models import CitationMetadata, CitationType
+from config import OPENAI_API_KEY
 
 
 # API Configuration
-OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
 GPT_MODEL = "gpt-4o"
 
 
