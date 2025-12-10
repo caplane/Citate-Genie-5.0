@@ -815,12 +815,323 @@ def update_note():
         }), 500
 
 
+@app.route('/api/process-author-date', methods=['POST'])
+def process_author_date():
+    """
+    Process a document in author-date mode.
+    
+    Extracts parenthetical citations like (Author, Year) and returns
+    multiple options for each citation for user selection.
+    
+    Request: multipart/form-data with 'file' field
+    Optional form fields:
+        - style: Citation style (default: 'apa')
+    
+    Response:
+    {
+        "success": true,
+        "session_id": "uuid",
+        "citations": [
+            {
+                "id": 1,
+                "original": "(Simonton, 1992)",
+                "options": [
+                    {
+                        "title": "Leaders, Machines, and Unification",
+                        "formatted": "Simonton, D. K. (1992). Leaders...",
+                        "authors": ["Simonton, Dean Keith"],
+                        "year": "1992",
+                        "source": "Crossref"
+                    },
+                    ...
+                ]
+            },
+            ...
+        ]
+    }
+    """
+    try:
+        if 'file' not in request.files:
+            return jsonify({
+                'success': False,
+                'error': 'No file provided'
+            }), 400
+        
+        file = request.files['file']
+        
+        if file.filename == '':
+            return jsonify({
+                'success': False,
+                'error': 'No file selected'
+            }), 400
+        
+        if not allowed_file(file.filename):
+            return jsonify({
+                'success': False,
+                'error': 'Only .docx files are supported'
+            }), 400
+        
+        style = request.form.get('style', 'apa')  # Default to APA for author-date
+        
+        # Read file bytes
+        file_bytes = file.read()
+        
+        # Extract citations from document
+        from document_processor import WordDocumentProcessor
+        from io import BytesIO
+        
+        processor = WordDocumentProcessor(BytesIO(file_bytes))
+        endnotes = processor.get_endnotes()
+        footnotes = processor.get_footnotes()
+        processor.cleanup()
+        
+        all_notes = endnotes + footnotes
+        
+        # Process each citation to get options
+        citations = []
+        for idx, note in enumerate(all_notes):
+            original_text = note['text']
+            note_id = note['id']
+            
+            # Get multiple options for this citation
+            try:
+                options = get_parenthetical_options(original_text, style, limit=5)
+                
+                formatted_options = []
+                for meta, formatted in options:
+                    formatted_options.append({
+                        'title': meta.title if meta else '',
+                        'formatted': formatted,
+                        'authors': meta.authors if meta else [],
+                        'year': meta.year if meta else '',
+                        'journal': getattr(meta, 'journal', '') or '',
+                        'publisher': getattr(meta, 'publisher', '') or '',
+                        'doi': getattr(meta, 'doi', '') or '',
+                        'source': getattr(meta, 'source_engine', 'Unknown')
+                    })
+                
+                citations.append({
+                    'id': idx + 1,
+                    'note_id': note_id,
+                    'original': original_text,
+                    'options': formatted_options
+                })
+                
+            except Exception as e:
+                print(f"[API] Error getting options for '{original_text[:40]}': {e}")
+                # Still include the citation, just with no options
+                citations.append({
+                    'id': idx + 1,
+                    'note_id': note_id,
+                    'original': original_text,
+                    'options': [],
+                    'error': str(e)
+                })
+        
+        # Create session to store results
+        session_id = sessions.create()
+        print(f"[API] Created author-date session {session_id[:8]}... for document {file.filename}")
+        
+        sessions.set(session_id, 'original_bytes', file_bytes)
+        sessions.set(session_id, 'style', style)
+        sessions.set(session_id, 'mode', 'author-date')
+        sessions.set(session_id, 'citations', citations)
+        sessions.set(session_id, 'filename', secure_filename(file.filename))
+        
+        return jsonify({
+            'success': True,
+            'session_id': session_id,
+            'citations': citations,
+            'stats': {
+                'total': len(citations),
+                'with_options': sum(1 for c in citations if c.get('options')),
+                'no_options': sum(1 for c in citations if not c.get('options'))
+            }
+        })
+        
+    except Exception as e:
+        print(f"[API] Error in /api/process-author-date: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/select-citation', methods=['POST'])
+def select_citation():
+    """
+    Select a specific citation option for an author-date citation.
+    
+    Request JSON:
+    {
+        "session_id": "uuid",
+        "citation_id": 1,
+        "option_index": 0  // Which option was selected (0-indexed)
+    }
+    
+    This updates the document with the selected citation.
+    """
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({
+                'success': False,
+                'error': 'Missing request data'
+            }), 400
+        
+        session_id = data.get('session_id')
+        citation_id = data.get('citation_id')
+        option_index = data.get('option_index', 0)
+        
+        if not session_id or citation_id is None:
+            return jsonify({
+                'success': False,
+                'error': 'Missing session_id or citation_id'
+            }), 400
+        
+        session_data = sessions.get(session_id)
+        if not session_data:
+            return jsonify({
+                'success': False,
+                'error': 'Session not found or expired'
+            }), 404
+        
+        citations = session_data.get('citations', [])
+        
+        # Find the citation
+        citation = None
+        for c in citations:
+            if c['id'] == citation_id:
+                citation = c
+                break
+        
+        if not citation:
+            return jsonify({
+                'success': False,
+                'error': f'Citation {citation_id} not found'
+            }), 404
+        
+        options = citation.get('options', [])
+        if option_index < 0 or option_index >= len(options):
+            return jsonify({
+                'success': False,
+                'error': f'Invalid option index {option_index}'
+            }), 400
+        
+        selected = options[option_index]
+        
+        # Update the citation with the selection
+        citation['selected'] = selected
+        citation['formatted'] = selected['formatted']
+        
+        sessions.set(session_id, 'citations', citations)
+        
+        return jsonify({
+            'success': True,
+            'citation_id': citation_id,
+            'formatted': selected['formatted']
+        })
+        
+    except Exception as e:
+        print(f"[API] Error in /api/select-citation: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/finalize-author-date', methods=['POST'])
+def finalize_author_date():
+    """
+    Finalize the author-date document with all selected citations.
+    
+    Request JSON:
+    {
+        "session_id": "uuid"
+    }
+    
+    Returns the processed document ready for download.
+    """
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({
+                'success': False,
+                'error': 'Missing request data'
+            }), 400
+        
+        session_id = data.get('session_id')
+        
+        if not session_id:
+            return jsonify({
+                'success': False,
+                'error': 'Missing session_id'
+            }), 400
+        
+        session_data = sessions.get(session_id)
+        if not session_data:
+            return jsonify({
+                'success': False,
+                'error': 'Session not found or expired'
+            }), 404
+        
+        original_bytes = session_data.get('original_bytes')
+        citations = session_data.get('citations', [])
+        
+        if not original_bytes:
+            return jsonify({
+                'success': False,
+                'error': 'Original document not found'
+            }), 404
+        
+        # Process the document with selected citations
+        from document_processor import WordDocumentProcessor
+        from io import BytesIO
+        
+        processor = WordDocumentProcessor(BytesIO(original_bytes))
+        
+        # Update each note with its selected citation
+        for citation in citations:
+            note_id = citation.get('note_id')
+            formatted = citation.get('formatted') or citation.get('original')
+            
+            if note_id and formatted:
+                # Try endnote first, then footnote
+                if not processor.write_endnote(note_id, formatted):
+                    processor.write_footnote(note_id, formatted)
+        
+        # Save to buffer
+        doc_buffer = processor.save_to_buffer()
+        processor.cleanup()
+        
+        # Store processed document
+        processed_bytes = doc_buffer.read()
+        sessions.set(session_id, 'processed_doc', processed_bytes)
+        
+        return jsonify({
+            'success': True,
+            'session_id': session_id,
+            'message': 'Document finalized successfully'
+        })
+        
+    except Exception as e:
+        print(f"[API] Error in /api/finalize-author-date: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
 @app.route('/health')
 def health():
     """Health check endpoint."""
     return jsonify({
         'status': 'healthy',
-        'version': '2.0.2',
+        'version': '2.1.0',  # Updated version for author-date support
         'sessions_count': len(sessions._sessions),
         'persistence': sessions._persistence_available
     })
