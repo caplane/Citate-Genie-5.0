@@ -1,645 +1,189 @@
 """
-citeflex/author_date_processor.py
+citeflex/processors/author_date.py
 
-Document processor for author-date citation styles.
-
-Workflow:
-1. Extract body text from Word document
-2. Find all (Author, Year) citations
-3. Search for each unique citation
-4. Generate formatted References section
-5. Append/replace References in document
-
-Supports styles:
-- APA (7th ed.)
-- Harvard
-- Chicago Author-Date
-- ASA (Sociology)
-- AAA (Anthropology)
-- Turabian Author-Date
+Processing utilities for author-date citation style documents.
+Handles generation of References sections for APA, Harvard, etc.
 
 Created: 2025-12-10
 """
 
-import os
-import re
 import zipfile
 import tempfile
 import shutil
-import xml.etree.ElementTree as ET
-from typing import List, Dict, Optional, Tuple, Any
-from dataclasses import dataclass, field
+import os
+import re
 from io import BytesIO
-
-from models import CitationMetadata, CitationType
-from processors.author_year_extractor import (
-    AuthorDateExtractor,
-    AuthorYearCitation,
-    extract_body_text_from_docx,
-    extract_references_section
-)
-from engines.author_year_search import AuthorDateEngine, get_engine
+from typing import List
 
 
-@dataclass
-class ReferenceEntry:
-    """A single reference entry with metadata and formatting."""
-    citation: AuthorYearCitation  # Original in-text citation
-    metadata: Optional[CitationMetadata]  # Looked-up metadata
-    formatted: str  # Formatted reference string
-    found: bool  # Whether lookup succeeded
-    confidence: float = 0.0
-    error: Optional[str] = None
-
-
-@dataclass
-class ProcessingResult:
-    """Result of processing a document for author-date citations."""
-    citations_found: int
-    citations_resolved: int
-    citations_failed: int
-    references: List[ReferenceEntry]
-    reference_list_text: str  # Formatted reference list
-    style: str
-    errors: List[str] = field(default_factory=list)
-
-
-class AuthorDateProcessor:
+def append_references_section(doc_bytes: bytes, references: List[str]) -> bytes:
     """
-    Processes Word documents with author-date citations.
-    
-    Extracts (Author, Year) citations from body text, looks up metadata,
-    and generates a formatted References section.
-    """
-    
-    # Supported author-date styles
-    SUPPORTED_STYLES = [
-        "APA (7th ed.)",
-        "Harvard",
-        "Chicago Author-Date",
-        "ASA (Sociology)",
-        "AAA (Anthropology)",
-        "Turabian Author-Date",
-    ]
-    
-    # Map style names to formatter
-    STYLE_MAP = {
-        "APA (7th ed.)": "apa",
-        "Harvard": "harvard",
-        "Chicago Author-Date": "chicago_author_date",
-        "ASA (Sociology)": "asa",
-        "AAA (Anthropology)": "aaa",
-        "Turabian Author-Date": "turabian",
-    }
-    
-    def __init__(self):
-        self.extractor = AuthorDateExtractor()
-        self.engine = get_engine()
-        self._formatters = {}
-    
-    def _get_formatter(self, style: str):
-        """Get formatter for the specified style."""
-        if style not in self._formatters:
-            style_key = self.STYLE_MAP.get(style, "apa")
-            
-            # Load the appropriate formatter based on style
-            try:
-                if style_key == "harvard":
-                    from formatters.harvard import HarvardFormatter
-                    self._formatters[style] = HarvardFormatter()
-                elif style_key == "chicago_author_date":
-                    from formatters.chicago_author_date import ChicagoAuthorDateFormatter
-                    self._formatters[style] = ChicagoAuthorDateFormatter()
-                else:
-                    # Default to APA for apa, asa, aaa, turabian
-                    from formatters.apa import APAFormatter
-                    self._formatters[style] = APAFormatter()
-            except ImportError as e:
-                print(f"[Processor] Formatter import error: {e}")
-                # Fallback to base formatter
-                from formatters.base import get_formatter
-                self._formatters[style] = get_formatter("APA")
-        
-        return self._formatters[style]
-    
-    def _detect_document_field(self, body_text: str) -> Optional[str]:
-        """
-        Detect the academic field/discipline of a document from its text.
-        
-        This helps Claude make better guesses for ambiguous citations by
-        providing context about what field the document is in.
-        
-        Returns field name like "psychology", "history", "economics", etc.
-        """
-        if not body_text:
-            return None
-        
-        text_lower = body_text.lower()
-        
-        # Field detection based on keyword frequency
-        field_keywords = {
-            'psychology': [
-                'psychology', 'psychological', 'cognitive', 'behavioral', 'behaviour',
-                'mental', 'perception', 'memory', 'learning', 'emotion', 'personality',
-                'psychologist', 'therapy', 'clinical', 'experimental', 'social psychology',
-                'developmental', 'neuroscience', 'brain', 'participants', 'subjects'
-            ],
-            'history': [
-                'history', 'historical', 'historian', 'century', 'era', 'period',
-                'war', 'revolution', 'empire', 'colonial', 'archive', 'manuscript',
-                'medieval', 'ancient', 'modern history', 'historiography'
-            ],
-            'economics': [
-                'economics', 'economic', 'economist', 'market', 'price', 'demand',
-                'supply', 'gdp', 'inflation', 'monetary', 'fiscal', 'trade',
-                'investment', 'capital', 'labor', 'wage', 'equilibrium'
-            ],
-            'sociology': [
-                'sociology', 'sociological', 'social', 'society', 'class', 'gender',
-                'race', 'inequality', 'institution', 'culture', 'community',
-                'demographic', 'population', 'urban', 'rural'
-            ],
-            'political science': [
-                'political', 'politics', 'government', 'democracy', 'election',
-                'voter', 'policy', 'legislature', 'congress', 'parliament',
-                'international relations', 'diplomacy', 'state'
-            ],
-            'medicine': [
-                'medical', 'patient', 'clinical', 'treatment', 'diagnosis',
-                'disease', 'symptom', 'therapy', 'hospital', 'physician',
-                'drug', 'pharmaceutical', 'trial', 'placebo'
-            ],
-            'biology': [
-                'biology', 'biological', 'cell', 'gene', 'dna', 'protein',
-                'organism', 'species', 'evolution', 'ecology', 'molecular'
-            ],
-            'literature': [
-                'literature', 'literary', 'novel', 'poetry', 'poem', 'fiction',
-                'narrative', 'author', 'text', 'reading', 'interpretation',
-                'criticism', 'modernism', 'postmodern'
-            ],
-            'philosophy': [
-                'philosophy', 'philosophical', 'ethics', 'moral', 'epistemology',
-                'metaphysics', 'logic', 'argument', 'reasoning', 'consciousness'
-            ]
-        }
-        
-        # Count keyword hits for each field
-        field_scores = {}
-        for field, keywords in field_keywords.items():
-            score = sum(text_lower.count(kw) for kw in keywords)
-            if score > 0:
-                field_scores[field] = score
-        
-        if not field_scores:
-            return None
-        
-        # Return field with highest score (if significantly above others)
-        best_field = max(field_scores, key=field_scores.get)
-        best_score = field_scores[best_field]
-        
-        # Only return if there's a clear winner (at least 5 hits)
-        if best_score >= 5:
-            return best_field
-        
-        return None
-    
-    def process_document(
-        self,
-        file_bytes: bytes,
-        style: str = "APA (7th ed.)",
-        progress_callback=None
-    ) -> Tuple[bytes, ProcessingResult]:
-        """
-        Process a document to extract citations and generate references.
-        
-        Args:
-            file_bytes: Word document as bytes
-            style: Citation style to use
-            progress_callback: Optional callback(status, current, total)
-            
-        Returns:
-            Tuple of (processed_document_bytes, ProcessingResult)
-        """
-        errors = []
-        
-        # Step 1: Extract body text
-        if progress_callback:
-            progress_callback("Extracting text...", 0, 100)
-        
-        body_text = extract_body_text_from_docx(file_bytes)
-        if not body_text:
-            errors.append("Could not extract text from document")
-            return file_bytes, ProcessingResult(
-                citations_found=0,
-                citations_resolved=0,
-                citations_failed=0,
-                references=[],
-                reference_list_text="",
-                style=style,
-                errors=errors
-            )
-        
-        # Step 2: Extract citations
-        if progress_callback:
-            progress_callback("Finding citations...", 10, 100)
-        
-        self.extractor.extract_from_text(body_text)
-        unique_citations = self.extractor.get_unique_citations()
-        
-        if not unique_citations:
-            errors.append("No author-date citations found in document")
-            return file_bytes, ProcessingResult(
-                citations_found=0,
-                citations_resolved=0,
-                citations_failed=0,
-                references=[],
-                reference_list_text="",
-                style=style,
-                errors=errors
-            )
-        
-        # Step 3: Detect document context/field for smarter lookups
-        document_context = self._detect_document_field(body_text)
-        if document_context:
-            print(f"[AuthorDateProcessor] Detected document field: {document_context}")
-        
-        # Step 4: Look up all citations in parallel for speed
-        references: List[ReferenceEntry] = []
-        total = len(unique_citations)
-        resolved = 0
-        
-        if progress_callback:
-            progress_callback("Looking up citations...", 25, 100)
-        
-        # Parallel batch lookup - much faster than sequential
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        
-        def lookup_single(citation: AuthorYearCitation) -> Tuple[AuthorYearCitation, Optional[CitationMetadata]]:
-            """Look up a single citation (runs in thread pool)."""
-            try:
-                metadata = self.engine.search(
-                    citation.author,
-                    citation.year,
-                    citation.second_author,
-                    timeout=8.0,  # 8s is plenty without Semantic Scholar retries
-                    context=document_context  # Pass field context for smarter matching
-                )
-                return (citation, metadata)
-            except Exception as e:
-                print(f"[AuthorDateProcessor] Lookup error for {citation.author} ({citation.year}): {e}")
-                return (citation, None)
-        
-        # Submit all lookups in parallel (max 4 concurrent to reduce rate limiting)
-        lookup_results: Dict[AuthorYearCitation, Optional[CitationMetadata]] = {}
-        
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = {
-                executor.submit(lookup_single, citation): citation 
-                for citation in unique_citations
-            }
-            
-            completed = 0
-            for future in as_completed(futures, timeout=90):  # 90s max for all citations
-                try:
-                    citation, metadata = future.result()
-                    lookup_results[citation] = metadata
-                    completed += 1
-                    
-                    if progress_callback:
-                        pct = 25 + int((completed / total) * 50)  # 25-75%
-                        progress_callback(
-                            f"Found {completed}/{total} references",
-                            pct, 100
-                        )
-                except Exception as e:
-                    citation = futures[future]
-                    lookup_results[citation] = None
-                    completed += 1
-        
-        # Process results in original order
-        for citation in unique_citations:
-            metadata = lookup_results.get(citation)
-            
-            if metadata:
-                # Format the reference
-                formatter = self._get_formatter(style)
-                formatted = formatter.format(metadata)
-                
-                references.append(ReferenceEntry(
-                    citation=citation,
-                    metadata=metadata,
-                    formatted=formatted,
-                    found=True,
-                    confidence=0.8  # Could get actual confidence from engine
-                ))
-                resolved += 1
-            else:
-                # Not found - create placeholder
-                references.append(ReferenceEntry(
-                    citation=citation,
-                    metadata=None,
-                    formatted=f"[NOT FOUND: {citation.author}, {citation.year}]",
-                    found=False,
-                    error="No matching publication found"
-                ))
-        
-        # Step 4: Sort references alphabetically by author
-        if progress_callback:
-            progress_callback("Sorting references...", 85, 100)
-        
-        def get_sort_key(r):
-            """Extract sort key from formatted reference (what actually displays)."""
-            formatted = r.formatted.strip()
-            if formatted.startswith("[NOT FOUND"):
-                # Use original citation author for unfound refs
-                return (r.citation.author.lower(), r.citation.year or "9999", "")
-            # Extract first word (last name) before comma
-            first_author = formatted.split(",")[0].strip().lower()
-            year = r.citation.year or "9999"
-            return (first_author, year, "")
-        
-        references.sort(key=get_sort_key)
-        
-        # Step 5: Generate reference list text
-        if progress_callback:
-            progress_callback("Generating reference list...", 90, 100)
-        
-        reference_list_text = self._generate_reference_list(references, style)
-        
-        # Step 6: Update document with references
-        if progress_callback:
-            progress_callback("Updating document...", 95, 100)
-        
-        processed_bytes = self._update_document_references(
-            file_bytes,
-            reference_list_text,
-            style
-        )
-        
-        if progress_callback:
-            progress_callback("Complete!", 100, 100)
-        
-        return processed_bytes, ProcessingResult(
-            citations_found=total,
-            citations_resolved=resolved,
-            citations_failed=total - resolved,
-            references=references,
-            reference_list_text=reference_list_text,
-            style=style,
-            errors=errors
-        )
-    
-    def _generate_reference_list(
-        self,
-        references: List[ReferenceEntry],
-        style: str
-    ) -> str:
-        """Generate formatted reference list text."""
-        lines = []
-        
-        # Header based on style
-        if style in ["APA (7th ed.)", "Harvard", "ASA (Sociology)"]:
-            lines.append("References")
-        elif style == "Chicago Author-Date":
-            lines.append("References")
-        elif style == "AAA (Anthropology)":
-            lines.append("References Cited")
-        elif style == "Turabian Author-Date":
-            lines.append("Bibliography")
-        else:
-            lines.append("References")
-        
-        lines.append("")  # Blank line after header
-        
-        # Add each reference
-        for ref in references:
-            lines.append(ref.formatted)
-            lines.append("")  # Blank line between entries (APA style)
-        
-        return "\n".join(lines)
-    
-    def _update_document_references(
-        self,
-        file_bytes: bytes,
-        reference_list_text: str,
-        style: str
-    ) -> bytes:
-        """
-        Update the Word document with the new references section.
-        
-        If a References section exists, replace it.
-        Otherwise, append to the end.
-        """
-        temp_dir = tempfile.mkdtemp()
-        
-        try:
-            # Extract docx
-            with zipfile.ZipFile(BytesIO(file_bytes), 'r') as zf:
-                zf.extractall(temp_dir)
-            
-            # Load document.xml
-            doc_path = os.path.join(temp_dir, 'word', 'document.xml')
-            
-            NS = {
-                'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main',
-                'xml': 'http://www.w3.org/XML/1998/namespace',
-            }
-            
-            # Register namespaces
-            for prefix, uri in NS.items():
-                ET.register_namespace(prefix, uri)
-            
-            tree = ET.parse(doc_path)
-            root = tree.getroot()
-            
-            # Find body element
-            body = root.find('.//w:body', NS)
-            if body is None:
-                return file_bytes
-            
-            # Look for existing References section
-            references_para = None
-            references_start_idx = None
-            
-            paragraphs = body.findall('w:p', NS)
-            for i, para in enumerate(paragraphs):
-                para_text = ''.join(t.text or '' for t in para.findall('.//w:t', NS))
-                if re.match(r'^References?\s*$|^Bibliography\s*$|^References Cited\s*$', 
-                           para_text.strip(), re.IGNORECASE):
-                    references_para = para
-                    references_start_idx = i
-                    break
-            
-            # Create new references paragraphs
-            new_paragraphs = self._create_reference_paragraphs(reference_list_text, NS)
-            
-            if references_start_idx is not None:
-                # Remove existing references section (from header to end)
-                # Keep paragraphs before references
-                for para in paragraphs[references_start_idx:]:
-                    body.remove(para)
-            
-            # Find sectPr (section properties) - should be at end
-            sect_pr = body.find('w:sectPr', NS)
-            
-            # Insert new paragraphs before sectPr
-            insert_idx = len(list(body)) - 1 if sect_pr is not None else len(list(body))
-            
-            for i, para in enumerate(new_paragraphs):
-                body.insert(insert_idx + i, para)
-            
-            # Write back
-            tree.write(doc_path, encoding='UTF-8', xml_declaration=True)
-            
-            # Repackage
-            output_buffer = BytesIO()
-            with zipfile.ZipFile(output_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for root_dir, dirs, files in os.walk(temp_dir):
-                    for file in files:
-                        file_path = os.path.join(root_dir, file)
-                        arcname = os.path.relpath(file_path, temp_dir)
-                        zf.write(file_path, arcname)
-            
-            output_buffer.seek(0)
-            return output_buffer.read()
-        
-        except Exception as e:
-            print(f"[AuthorDateProcessor] Error updating document: {e}")
-            return file_bytes
-        
-        finally:
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
-    
-    def _create_reference_paragraphs(
-        self,
-        reference_list_text: str,
-        NS: Dict[str, str]
-    ) -> List[ET.Element]:
-        """Create Word XML paragraphs for the reference list."""
-        paragraphs = []
-        
-        lines = reference_list_text.split('\n')
-        
-        for line in lines:
-            para = ET.Element(f"{{{NS['w']}}}p")
-            
-            if line.strip():
-                # Check if this is the header
-                if re.match(r'^References?$|^Bibliography$|^References Cited$', 
-                           line.strip(), re.IGNORECASE):
-                    # Add heading style
-                    pPr = ET.SubElement(para, f"{{{NS['w']}}}pPr")
-                    pStyle = ET.SubElement(pPr, f"{{{NS['w']}}}pStyle")
-                    pStyle.set(f"{{{NS['w']}}}val", "Heading1")
-                
-                # Create run with text
-                run = ET.SubElement(para, f"{{{NS['w']}}}r")
-                
-                # Handle italics (marked with <i> tags in formatted output)
-                parts = re.split(r'(<i>.*?</i>)', line)
-                
-                for part in parts:
-                    if not part:
-                        continue
-                    
-                    if part.startswith('<i>') and part.endswith('</i>'):
-                        # Italic text
-                        inner = part[3:-4]
-                        italic_run = ET.SubElement(para, f"{{{NS['w']}}}r")
-                        rPr = ET.SubElement(italic_run, f"{{{NS['w']}}}rPr")
-                        ET.SubElement(rPr, f"{{{NS['w']}}}i")
-                        t = ET.SubElement(italic_run, f"{{{NS['w']}}}t")
-                        t.text = inner
-                        t.set(f"{{{NS['xml']}}}space", "preserve")
-                    else:
-                        # Normal text
-                        t = ET.SubElement(run, f"{{{NS['w']}}}t")
-                        t.text = part
-                        t.set(f"{{{NS['xml']}}}space", "preserve")
-            
-            paragraphs.append(para)
-        
-        return paragraphs
-    
-    def extract_citations_only(self, file_bytes: bytes) -> List[AuthorYearCitation]:
-        """
-        Extract citations without looking them up.
-        
-        Useful for preview/validation before full processing.
-        """
-        body_text = extract_body_text_from_docx(file_bytes)
-        if not body_text:
-            return []
-        
-        citations = self.extractor.extract_from_text(body_text)
-        return self.extractor.get_unique_citations(citations)
-
-
-# =============================================================================
-# CONVENIENCE FUNCTIONS
-# =============================================================================
-
-def process_author_date_document(
-    file_bytes: bytes,
-    style: str = "APA (7th ed.)",
-    progress_callback=None
-) -> Tuple[bytes, ProcessingResult]:
-    """
-    Convenience function to process a document.
+    Append a References section to the end of a Word document.
     
     Args:
-        file_bytes: Word document as bytes
-        style: Citation style
-        progress_callback: Optional progress callback
+        doc_bytes: Original .docx file as bytes
+        references: List of formatted reference strings (already formatted in target style)
         
     Returns:
-        Tuple of (processed_document_bytes, ProcessingResult)
+        Modified document bytes with References section appended
     """
-    processor = AuthorDateProcessor()
-    return processor.process_document(file_bytes, style, progress_callback)
-
-
-def get_supported_styles() -> List[str]:
-    """Return list of supported author-date styles."""
-    return AuthorDateProcessor.SUPPORTED_STYLES.copy()
-
-
-# =============================================================================
-# TESTING
-# =============================================================================
-
-if __name__ == "__main__":
-    print("=" * 60)
-    print("AUTHOR-DATE PROCESSOR TEST")
-    print("=" * 60)
+    if not references:
+        return doc_bytes
     
-    # Create a test document text
-    test_text = """
-    According to Bandura (1977), self-efficacy plays a crucial role in behavior.
-    This was further explored by Kahneman and Tversky (1979) in their work on 
-    prospect theory.
+    temp_dir = tempfile.mkdtemp()
     
-    Recent research (Diener et al., 2014) has examined subjective well-being.
-    The positive psychology movement (Seligman, 2011) has grown significantly.
+    try:
+        # Extract docx
+        with zipfile.ZipFile(BytesIO(doc_bytes), 'r') as zf:
+            zf.extractall(temp_dir)
+        
+        # Read document.xml
+        doc_path = os.path.join(temp_dir, 'word', 'document.xml')
+        if not os.path.exists(doc_path):
+            return doc_bytes
+        
+        with open(doc_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Build References section XML
+        references_xml = _build_references_xml(references)
+        
+        # Find the closing </w:body> tag and insert before it
+        body_close_pattern = r'(</w:body>)'
+        
+        if re.search(body_close_pattern, content):
+            new_content = re.sub(
+                body_close_pattern,
+                references_xml + r'\1',
+                content,
+                count=1
+            )
+        else:
+            # Fallback: couldn't find body close, return original
+            return doc_bytes
+        
+        # Write modified document.xml
+        with open(doc_path, 'w', encoding='utf-8') as f:
+            f.write(new_content)
+        
+        # Repackage docx
+        output_buffer = BytesIO()
+        with zipfile.ZipFile(output_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for root, dirs, files in os.walk(temp_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, temp_dir)
+                    zf.write(file_path, arcname)
+        
+        output_buffer.seek(0)
+        return output_buffer.read()
+        
+    except Exception as e:
+        print(f"[append_references_section] Error: {e}")
+        return doc_bytes
+        
+    finally:
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+
+
+def _build_references_xml(references: List[str]) -> str:
     """
+    Build Word XML for References section.
     
-    print("\nTest text:")
-    print(test_text)
+    Creates:
+    - A "References" heading paragraph
+    - Each reference as a hanging-indent paragraph
+    """
+    import html
     
-    print("\n" + "=" * 60)
-    print("Extracting citations...")
+    paragraphs = []
     
-    extractor = AuthorDateExtractor()
-    citations = extractor.extract_from_text(test_text)
-    unique = extractor.get_unique_citations()
+    # References heading (Heading 1 style)
+    paragraphs.append('''
+<w:p>
+  <w:pPr>
+    <w:pStyle w:val="Heading1"/>
+    <w:spacing w:before="480" w:after="240"/>
+  </w:pPr>
+  <w:r>
+    <w:t>References</w:t>
+  </w:r>
+</w:p>''')
     
-    print(f"\nFound {len(unique)} unique citations:")
-    for c in unique:
-        print(f"  - {c.author}, {c.year}")
+    # Each reference with hanging indent
+    for ref in references:
+        if not ref:
+            continue
+        
+        # Escape HTML entities and handle italic tags
+        escaped = _format_reference_xml(ref)
+        
+        paragraphs.append(f'''
+<w:p>
+  <w:pPr>
+    <w:spacing w:after="120" w:line="480" w:lineRule="auto"/>
+    <w:ind w:left="720" w:hanging="720"/>
+  </w:pPr>
+  {escaped}
+</w:p>''')
     
-    print("\n" + "=" * 60)
-    print("Supported styles:")
-    for style in get_supported_styles():
-        print(f"  - {style}")
+    return ''.join(paragraphs)
+
+
+def _format_reference_xml(text: str) -> str:
+    """
+    Convert formatted reference text to Word XML runs.
+    
+    Handles <i>italic</i> tags and escapes XML entities.
+    """
+    import html as html_module
+    import re
+    
+    # Unescape any HTML entities first
+    text = html_module.unescape(text)
+    
+    # Split by italic tags
+    parts = re.split(r'(<i>.*?</i>)', text)
+    runs = []
+    
+    for part in parts:
+        if not part:
+            continue
+        
+        if part.startswith('<i>') and part.endswith('</i>'):
+            # Italic text
+            inner = part[3:-4]
+            inner_escaped = inner.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            runs.append(f'<w:r><w:rPr><w:i/></w:rPr><w:t xml:space="preserve">{inner_escaped}</w:t></w:r>')
+        else:
+            # Normal text
+            escaped = part.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            runs.append(f'<w:r><w:t xml:space="preserve">{escaped}</w:t></w:r>')
+    
+    return ''.join(runs)
+
+
+def deduplicate_references(references: List[str]) -> List[str]:
+    """
+    Remove duplicate references and sort alphabetically.
+    
+    Args:
+        references: List of formatted references
+        
+    Returns:
+        Sorted, deduplicated list
+    """
+    # Use set for deduplication, preserving first occurrence order
+    seen = set()
+    unique = []
+    
+    for ref in references:
+        # Normalize for comparison (lowercase, strip whitespace)
+        normalized = ref.lower().strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            unique.append(ref)
+    
+    # Sort alphabetically (by author surname typically)
+    return sorted(unique, key=lambda x: x.lower())
