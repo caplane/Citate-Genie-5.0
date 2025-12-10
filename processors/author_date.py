@@ -187,3 +187,23 @@ def deduplicate_references(references: List[str]) -> List[str]:
     
     # Sort alphabetically (by author surname typically)
     return sorted(unique, key=lambda x: x.lower())
+
+
+def process_author_date_document(doc_bytes: bytes, references: List[str]) -> bytes:
+    """
+    Process an author-date style document by appending a References section.
+    
+    This is a convenience function that combines deduplication and appending.
+    
+    Args:
+        doc_bytes: Original .docx file as bytes
+        references: List of formatted reference strings
+        
+    Returns:
+        Modified document bytes with References section appended
+    """
+    # Deduplicate and sort
+    unique_refs = deduplicate_references(references)
+    
+    # Append to document
+    return append_references_section(doc_bytes, unique_refs)
