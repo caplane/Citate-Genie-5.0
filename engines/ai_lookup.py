@@ -25,10 +25,8 @@ from dataclasses import dataclass
 
 from models import CitationMetadata, CitationType
 
-# Get API keys directly from environment (avoids config.py dependency)
-import os
-OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
-ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
+# Get API keys from config (centralized with .lstrip('=') fix)
+from config import OPENAI_API_KEY, ANTHROPIC_API_KEY
 
 
 # =============================================================================
