@@ -4,6 +4,7 @@ citeflex/config.py
 Configuration, constants, and shared settings.
 
 Version History:
+    2025-12-10: Added OPENAI_API_KEY and ANTHROPIC_API_KEY with .lstrip('=') fix
     2025-12-07: Added SERPAPI_KEY for Google Scholar integration
     2025-12-05: Added version tracking, fixed get_gov_agency to check specific domains first
 """
@@ -15,6 +16,11 @@ from typing import Dict
 # API KEYS (from environment)
 # =============================================================================
 
+# AI/LLM API Keys (with .lstrip('=') to handle copy-paste artifacts)
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '').lstrip('=')
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '').lstrip('=')
+
+# Other API Keys
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
 COURTLISTENER_API_KEY = os.environ.get('CL_API_KEY', '')
 PUBMED_API_KEY = os.environ.get('PUBMED_API_KEY', '')
