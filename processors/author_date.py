@@ -348,11 +348,18 @@ class AuthorDateProcessor:
         if progress_callback:
             progress_callback("Sorting references...", 85, 100)
         
-        references.sort(key=lambda r: (
-            r.citation.author.lower(),
-            r.citation.year,
-            r.citation.second_author.lower() if r.citation.second_author else ""
-        ))
+        def get_sort_key(r):
+            """Extract sort key from formatted reference (what actually displays)."""
+            formatted = r.formatted.strip()
+            if formatted.startswith("[NOT FOUND"):
+                # Use original citation author for unfound refs
+                return (r.citation.author.lower(), r.citation.year or "9999", "")
+            # Extract first word (last name) before comma
+            first_author = formatted.split(",")[0].strip().lower()
+            year = r.citation.year or "9999"
+            return (first_author, year, "")
+        
+        references.sort(key=get_sort_key)
         
         # Step 5: Generate reference list text
         if progress_callback:
