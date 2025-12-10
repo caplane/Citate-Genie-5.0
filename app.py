@@ -4,10 +4,8 @@ citeflex/app.py
 Flask application for CiteFlex Unified.
 
 Version History:
-    2025-12-10 12:00: Added author-date processing endpoints
-                      - /api/process-author-date for full document processing
-                      - /api/preview-citations for extracting citations (preview)
-                      - /api/reference-lookup for single citation resolution
+    2025-12-10: Added /api/cite/parenthetical endpoint for Author-Date mode.
+                Returns multiple options for user selection.
     2025-12-06 13:30: Added debug logging to diagnose session loss issue
     2025-12-06 13:00: CRITICAL FIX - Fixed /api/update and /api/download to properly
                       access session data. Override feature now works correctly.
@@ -17,6 +15,15 @@ Version History:
     2025-12-05 13:35: Updated to use unified_router, added /api/update endpoint
                       Enhanced /api/cite to return type and source info
                       Enhanced /api/process to return notes list for workbench UI
+
+FIXES APPLIED:
+1. Thread-safe session management with threading.Lock()
+2. Session expiration (4 hours) to prevent memory leaks
+3. Periodic cleanup of expired sessions
+4. File-based persistence for sessions (survives deployments with Railway Volume)
+5. CRITICAL: /api/update now properly updates document (was silently failing)
+6. CRITICAL: /api/download now returns updated document (was returning original)
+7. DEBUG: Added logging to track session creation and lookup
 """
 
 import os
@@ -31,8 +38,8 @@ from functools import wraps
 from flask import Flask, request, jsonify, render_template, send_file
 from werkzeug.utils import secure_filename
 
-from routers.unified import get_citation, get_multiple_citations
-from processors.word_document import process_document
+from unified_router import get_citation, get_multiple_citations, get_parenthetical_options
+from document_processor import process_document
 
 # =============================================================================
 # APP CONFIGURATION
@@ -63,7 +70,7 @@ class SessionManager:
     
     Setup for Railway:
     1. Go to your service in Railway
-    2. Add a Volume: Settings → Volumes → Add Volume
+    2. Add a Volume: Settings â†’ Volumes â†’ Add Volume
     3. Mount path: /data
     4. Sessions will now survive deployments
     """
@@ -301,15 +308,6 @@ def index():
     return render_template('index.html')
 
 
-@app.route('/api/version')
-def get_version():
-    """Return API version."""
-    return jsonify({
-        'version': '2.1.0',
-        'features': ['footnotes', 'author-date', 'multi-engine']
-    })
-
-
 @app.route('/api/cite', methods=['POST'])
 def cite():
     """
@@ -444,10 +442,91 @@ def cite_multiple():
         }), 500
 
 
+@app.route('/api/cite/parenthetical', methods=['POST'])
+def cite_parenthetical():
+    """
+    Parenthetical citation options API for Author-Date mode.
+    
+    Returns multiple possible works for a (Author, Year) citation,
+    allowing user to select the correct one.
+    
+    Request JSON:
+    {
+        "query": "(Simonton, 1992)",
+        "style": "APA 7",
+        "limit": 5
+    }
+    
+    Response JSON:
+    {
+        "success": true,
+        "query": "(Simonton, 1992)",
+        "options": [
+            {
+                "id": 0,
+                "citation": "Simonton, D. K. (1992). Leaders of American...",
+                "title": "Leaders of American psychology...",
+                "source": "ai_lookup",
+                "confidence": "high",
+                "metadata": {...}
+            },
+            ...
+        ]
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        if not data or not data.get('query'):
+            return jsonify({
+                'success': False,
+                'error': 'Missing query parameter'
+            }), 400
+        
+        query = data['query'].strip()
+        style = data.get('style', 'APA 7')
+        limit = min(data.get('limit', 5), 10)  # Cap at 10
+        
+        # Get options from AI lookup
+        results = get_parenthetical_options(query, style, limit)
+        
+        if not results:
+            return jsonify({
+                'success': False,
+                'error': 'No matching works found',
+                'query': query
+            }), 404
+        
+        return jsonify({
+            'success': True,
+            'query': query,
+            'options': [
+                {
+                    'id': idx,
+                    'citation': formatted,
+                    'title': meta.title if meta else '',
+                    'authors': meta.authors if meta else [],
+                    'year': meta.year if meta else '',
+                    'source': meta.source_engine if meta else 'ai_lookup',
+                    'confidence': 'high' if meta.confidence >= 0.9 else 'medium' if meta.confidence >= 0.6 else 'low',
+                    'metadata': meta.to_dict() if meta else None
+                }
+                for idx, (meta, formatted) in enumerate(results)
+            ]
+        })
+        
+    except Exception as e:
+        print(f"[API] Error in /api/cite/parenthetical: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
 @app.route('/api/process', methods=['POST'])
 def process_doc():
     """
-    Document processing API (footnote/endnote mode).
+    Document processing API.
     
     Expects multipart form with:
     - file: .docx document
@@ -497,7 +576,6 @@ def process_doc():
         sessions.set(session_id, 'processed_doc', processed_bytes)
         sessions.set(session_id, 'original_bytes', file_bytes)  # Store original for re-processing
         sessions.set(session_id, 'style', style)
-        sessions.set(session_id, 'mode', 'footnote')  # Track processing mode
         sessions.set(session_id, 'results', [
             {
                 'id': idx + 1,
@@ -506,7 +584,7 @@ def process_doc():
                 'success': r.success,
                 'error': r.error,
                 'form': r.citation_form,
-                'type': r.metadata.citation_type.name.lower() if hasattr(r, 'metadata') and r.metadata and r.metadata.citation_type else 'unknown'
+                'type': r.citation_type.name.lower() if hasattr(r, 'citation_type') and r.citation_type else 'unknown'
             }
             for idx, r in enumerate(results)
         ])
@@ -519,8 +597,8 @@ def process_doc():
         notes = []
         for idx, r in enumerate(results):
             note_type = 'unknown'
-            if hasattr(r, 'metadata') and r.metadata and r.metadata.citation_type:
-                note_type = r.metadata.citation_type.name.lower()
+            if hasattr(r, 'citation_type') and r.citation_type:
+                note_type = r.citation_type.name.lower()
             
             notes.append({
                 'id': idx + 1,
@@ -556,345 +634,6 @@ def process_doc():
         }), 500
 
 
-# =============================================================================
-# AUTHOR-DATE PROCESSING ENDPOINTS
-# =============================================================================
-
-@app.route('/api/preview-citations', methods=['POST'])
-def preview_citations():
-    """
-    Extract in-text citations from document body (preview mode).
-    Does not search for metadata - just extracts (Author, Year) patterns.
-    
-    Expects multipart form with:
-    - file: .docx document
-    
-    Returns list of extracted citations.
-    """
-    try:
-        if 'file' not in request.files:
-            return jsonify({
-                'success': False,
-                'error': 'No file provided'
-            }), 400
-        
-        file = request.files['file']
-        
-        if file.filename == '':
-            return jsonify({
-                'success': False,
-                'error': 'No file selected'
-            }), 400
-        
-        if not allowed_file(file.filename):
-            return jsonify({
-                'success': False,
-                'error': 'Only .docx files are supported'
-            }), 400
-        
-        # Read file bytes
-        file_bytes = file.read()
-        
-        # Import author-date extractor
-        from processors.author_year_extractor import AuthorDateExtractor
-        
-        # Extract citations without processing
-        extractor = AuthorDateExtractor()
-        citations = extractor.extract_citations_from_docx(file_bytes)
-        unique = extractor.get_unique_citations(citations)
-        
-        return jsonify({
-            'success': True,
-            'citations': [
-                {
-                    'author': c.author,
-                    'year': c.year,
-                    'second_author': c.second_author,
-                    'is_et_al': c.is_et_al,
-                    'raw_text': c.raw_text,
-                    'page': c.page
-                }
-                for c in unique
-            ],
-            'total_found': len(citations),
-            'unique_count': len(unique),
-            'filename': file.filename
-        })
-        
-    except Exception as e:
-        print(f"[API] Error in /api/preview-citations: {e}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-
-@app.route('/api/process-author-date', methods=['POST'])
-def process_author_date():
-    """
-    Process document with author-date citations.
-    Extracts (Author, Year) citations, searches for metadata,
-    generates formatted References section.
-    
-    Expects multipart form with:
-    - file: .docx document
-    - style: citation style (APA, Harvard, Chicago Author-Date, etc.)
-    
-    Returns processed document with References section appended.
-    """
-    try:
-        if 'file' not in request.files:
-            return jsonify({
-                'success': False,
-                'error': 'No file provided'
-            }), 400
-        
-        file = request.files['file']
-        
-        if file.filename == '':
-            return jsonify({
-                'success': False,
-                'error': 'No file selected'
-            }), 400
-        
-        if not allowed_file(file.filename):
-            return jsonify({
-                'success': False,
-                'error': 'Only .docx files are supported'
-            }), 400
-        
-        style = request.form.get('style', 'APA')
-        
-        # Read file bytes
-        file_bytes = file.read()
-        
-        # Import author-date processor
-        from processors.author_date import AuthorDateProcessor
-        
-        # Process document
-        processor = AuthorDateProcessor()
-        processed_bytes, result = processor.process_document(file_bytes, style)
-        
-        # Create session to store results
-        session_id = sessions.create()
-        print(f"[API] Created author-date session {session_id[:8]}... for document {file.filename}")
-        
-        sessions.set(session_id, 'processed_doc', processed_bytes)
-        sessions.set(session_id, 'original_bytes', file_bytes)
-        sessions.set(session_id, 'style', style)
-        sessions.set(session_id, 'mode', 'author-date')
-        sessions.set(session_id, 'filename', secure_filename(file.filename))
-        
-        # Store references for UI
-        references = []
-        for ref in result.references:
-            references.append({
-                'author': ref.citation.author,
-                'year': ref.citation.year,
-                'second_author': ref.citation.second_author,
-                'is_et_al': ref.citation.is_et_al,
-                'formatted': ref.formatted,
-                'found': ref.found,
-                'confidence': ref.confidence,
-                'error': ref.error,
-                'metadata': ref.metadata.to_dict() if ref.metadata else None
-            })
-        
-        sessions.set(session_id, 'references', references)
-        
-        print(f"[API] Session {session_id[:8]} initialized with {len(references)} references")
-        
-        return jsonify({
-            'success': True,
-            'session_id': session_id,
-            'references': references,
-            'reference_list': result.reference_list_text,
-            'stats': {
-                'total': result.citations_found,
-                'resolved': result.citations_resolved,
-                'failed': result.citations_failed
-            },
-            'errors': result.errors
-        })
-        
-    except Exception as e:
-        print(f"[API] Error in /api/process-author-date: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-
-@app.route('/api/reference-lookup', methods=['POST'])
-def reference_lookup():
-    """
-    Look up a single author-date citation.
-    
-    Request JSON:
-    {
-        "author": "Bandura",
-        "year": "1977",
-        "second_author": null,  // optional
-        "style": "APA"
-    }
-    
-    Returns formatted reference and metadata.
-    """
-    try:
-        data = request.get_json()
-        
-        if not data or not data.get('author') or not data.get('year'):
-            return jsonify({
-                'success': False,
-                'error': 'Missing author or year parameter'
-            }), 400
-        
-        author = data['author']
-        year = data['year']
-        second_author = data.get('second_author')
-        style = data.get('style', 'APA')
-        
-        # Import author-date engine
-        from engines.author_year_search import AuthorDateEngine
-        from processors.author_year_extractor import AuthorYearCitation
-        
-        # Create citation object
-        citation = AuthorYearCitation(
-            author=author,
-            year=year,
-            second_author=second_author,
-            is_et_al=False,
-            raw_text=f"({author}, {year})"
-        )
-        
-        # Search for metadata
-        engine = AuthorDateEngine()
-        metadata = engine.search(author, year, second_author)  # Returns CitationMetadata or None
-        
-        if not metadata:
-            return jsonify({
-                'success': False,
-                'error': f'Could not find reference for {author} ({year})'
-            }), 404
-        
-        # Format the reference using the processor's formatter
-        from processors.author_date import AuthorDateProcessor
-        processor = AuthorDateProcessor()
-        formatter = processor._get_formatter(style)
-        formatted = formatter.format(metadata)
-        
-        return jsonify({
-            'success': True,
-            'formatted': formatted,
-            'confidence': metadata.confidence if metadata.confidence else 0.8,
-            'metadata': metadata.to_dict() if metadata else None
-        })
-        
-    except Exception as e:
-        print(f"[API] Error in /api/reference-lookup: {e}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-
-@app.route('/api/update-reference', methods=['POST'])
-def update_reference():
-    """
-    Update a specific reference in the processed document.
-    
-    Request JSON:
-    {
-        "session_id": "uuid",
-        "index": 0,
-        "formatted": "New formatted reference text"
-    }
-    """
-    try:
-        data = request.get_json()
-        
-        if not data:
-            return jsonify({
-                'success': False,
-                'error': 'Missing request data'
-            }), 400
-        
-        session_id = data.get('session_id')
-        index = data.get('index')
-        new_formatted = data.get('formatted', '')
-        
-        if not session_id or index is None:
-            return jsonify({
-                'success': False,
-                'error': 'Missing session_id or index'
-            }), 400
-        
-        session_data = sessions.get(session_id)
-        
-        if not session_data:
-            return jsonify({
-                'success': False,
-                'error': 'Session not found or expired'
-            }), 404
-        
-        references = session_data.get('references', [])
-        
-        if index < 0 or index >= len(references):
-            return jsonify({
-                'success': False,
-                'error': f'Reference index {index} out of range'
-            }), 404
-        
-        # Update the reference
-        references[index]['formatted'] = new_formatted
-        references[index]['found'] = True  # Mark as manually resolved
-        sessions.set(session_id, 'references', references)
-        
-        # Regenerate the document with updated references
-        from processors.author_date import AuthorDateProcessor
-        
-        original_bytes = session_data.get('original_bytes')
-        style = session_data.get('style', 'APA')
-        
-        if original_bytes:
-            # Rebuild reference list text
-            ref_list_lines = []
-            for ref in references:
-                if ref['formatted']:
-                    ref_list_lines.append(ref['formatted'])
-            
-            reference_list_text = '\n\n'.join(sorted(ref_list_lines))
-            
-            # Update document with new reference list
-            processor = AuthorDateProcessor()
-            updated_bytes = processor._update_document_references(
-                original_bytes, 
-                reference_list_text, 
-                style
-            )
-            
-            sessions.set(session_id, 'processed_doc', updated_bytes)
-        
-        return jsonify({
-            'success': True,
-            'index': index,
-            'formatted': new_formatted
-        })
-        
-    except Exception as e:
-        print(f"[API] Error in /api/update-reference: {e}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-
-# =============================================================================
-# SHARED ENDPOINTS
-# =============================================================================
-
 @app.route('/api/download/<session_id>')
 def download(session_id: str):
     """Download processed document."""
@@ -910,7 +649,6 @@ def download(session_id: str):
         
         processed_doc = session_data.get('processed_doc')
         filename = session_data.get('filename', 'processed.docx')
-        mode = session_data.get('mode', 'footnote')
         
         if not processed_doc:
             return jsonify({
@@ -922,14 +660,11 @@ def download(session_id: str):
         buffer = BytesIO(processed_doc)
         buffer.seek(0)
         
-        # Different prefix based on mode
-        prefix = 'citeflex' if mode == 'footnote' else 'references'
-        
         return send_file(
             buffer,
             mimetype='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
             as_attachment=True,
-            download_name=f"{prefix}_{filename}" if filename else f"{prefix}_processed.docx"
+            download_name=f"citeflex_{filename}" if filename else "citeflex_processed.docx"
         )
         
     except Exception as e:
@@ -952,34 +687,18 @@ def get_results(session_id: str):
                 'error': 'Session not found or expired'
             }), 404
         
-        mode = session_data.get('mode', 'footnote')
+        results = session_data.get('results')
         
-        if mode == 'author-date':
-            references = session_data.get('references')
-            if references is None:
-                return jsonify({
-                    'success': False,
-                    'error': 'References not found'
-                }), 404
-            
+        if results is None:
             return jsonify({
-                'success': True,
-                'mode': 'author-date',
-                'references': references
-            })
-        else:
-            results = session_data.get('results')
-            if results is None:
-                return jsonify({
-                    'success': False,
-                    'error': 'Results not found'
-                }), 404
-            
-            return jsonify({
-                'success': True,
-                'mode': 'footnote',
-                'results': results
-            })
+                'success': False,
+                'error': 'Results not found'
+            }), 404
+        
+        return jsonify({
+            'success': True,
+            'results': results
+        })
         
     except Exception as e:
         return jsonify({
@@ -991,7 +710,7 @@ def get_results(session_id: str):
 @app.route('/api/update', methods=['POST'])
 def update_note():
     """
-    Update a specific note in the processed document (footnote mode).
+    Update a specific note in the processed document.
     
     Request JSON:
     {
@@ -999,6 +718,9 @@ def update_note():
         "note_id": 1,
         "html": "formatted citation text"
     }
+    
+    This re-processes the document with the updated note.
+    Updated: 2025-12-06 - Added retry logic and file locking
     """
     try:
         data = request.get_json()
@@ -1054,7 +776,7 @@ def update_note():
             }), 404
         
         # Update the document - this is the critical part
-        from processors.word_document import update_document_note
+        from document_processor import update_document_note
         try:
             updated_doc = update_document_note(processed_doc, note_id, new_html)
             
@@ -1098,26 +820,9 @@ def health():
     """Health check endpoint."""
     return jsonify({
         'status': 'healthy',
-        'version': '2.1.0',
+        'version': '2.0.2',
         'sessions_count': len(sessions._sessions),
-        'persistence': sessions._persistence_available,
-        'features': ['footnotes', 'author-date']
-    })
-
-
-@app.route('/debug/env')
-def debug_env():
-    """Debug endpoint to check which API keys are configured."""
-    return jsonify({
-        'OPENAI_API_KEY': 'SET ✓' if os.environ.get('OPENAI_API_KEY') else 'NOT SET ✗',
-        'SERPAPI_KEY': 'SET ✓' if os.environ.get('SERPAPI_KEY') else 'NOT SET ✗',
-        'ANTHROPIC_API_KEY': 'SET ✓' if os.environ.get('ANTHROPIC_API_KEY') else 'NOT SET ✗',
-        'SEMANTIC_SCHOLAR_API_KEY': 'SET ✓' if os.environ.get('SEMANTIC_SCHOLAR_API_KEY') else 'NOT SET ✗',
-        'COURTLISTENER_API_KEY': 'SET ✓' if os.environ.get('CL_API_KEY') else 'NOT SET ✗',
-        'GOOGLE_CSE_API_KEY': 'SET ✓' if os.environ.get('GOOGLE_CSE_API_KEY') else 'NOT SET ✗',
-        'GEMINI_API_KEY': 'SET ✓' if os.environ.get('GEMINI_API_KEY') else 'NOT SET ✗',
-        'note': 'Values hidden for security. This only shows if keys are present.',
-        'ai_fallback_tiers': 'Tier 1: Free engines → Tier 2: GPT-4o → Tier 3: Claude Opus'
+        'persistence': sessions._persistence_available
     })
 
 
