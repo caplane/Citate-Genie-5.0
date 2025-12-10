@@ -660,26 +660,33 @@ def download(session_id: str):
             citations = session_data.get('citations', [])
             
             if original_bytes:
-                from document_processor import WordDocumentProcessor
-                from io import BytesIO
+                # For author-date mode, we append a References section
+                # The in-text citations stay as-is; we generate the reference list
+                from processors.author_date import append_references_section, deduplicate_references
                 
-                processor = WordDocumentProcessor(BytesIO(original_bytes))
-                
-                # Update each note with its selected/original citation
+                # Collect formatted references (use first option or skip if none)
+                references = []
                 for citation in citations:
-                    note_id = citation.get('note_id')
-                    formatted = citation.get('formatted') or citation.get('original')
-                    
-                    if note_id and formatted:
-                        if not processor.write_endnote(note_id, formatted):
-                            processor.write_footnote(note_id, formatted)
+                    options = citation.get('options', [])
+                    if options:
+                        # Use selected option if available, otherwise first option
+                        selected = citation.get('selected') or options[0]
+                        formatted = selected.get('formatted', '')
+                        if formatted:
+                            references.append(formatted)
                 
-                doc_buffer = processor.save_to_buffer()
-                processor.cleanup()
+                # Deduplicate and sort references
+                references = deduplicate_references(references)
                 
-                processed_doc = doc_buffer.read()
+                # Append references section to document
+                if references:
+                    processed_doc = append_references_section(original_bytes, references)
+                else:
+                    # No references to add, return original
+                    processed_doc = original_bytes
+                
                 sessions.set(session_id, 'processed_doc', processed_doc)
-                print(f"[API] Auto-finalized {len(citations)} citations")
+                print(f"[API] Auto-finalized with {len(references)} references")
         
         if not processed_doc:
             return jsonify({
@@ -907,22 +914,20 @@ def process_author_date():
         # Read file bytes
         file_bytes = file.read()
         
-        # Extract citations from document
-        from document_processor import WordDocumentProcessor
-        from io import BytesIO
+        # Extract author-date citations from document BODY TEXT (not notes!)
+        from processors.author_year_extractor import AuthorDateExtractor
         
-        processor = WordDocumentProcessor(BytesIO(file_bytes))
-        endnotes = processor.get_endnotes()
-        footnotes = processor.get_footnotes()
-        processor.cleanup()
+        extractor = AuthorDateExtractor()
+        extracted_citations = extractor.extract_citations_from_docx(file_bytes)
+        unique_citations = extractor.get_unique_citations(extracted_citations)
         
-        all_notes = endnotes + footnotes
+        print(f"[API] Extracted {len(extracted_citations)} citations, {len(unique_citations)} unique")
         
-        # Process each citation to get options
+        # Process each unique citation to get options
         citations = []
-        for idx, note in enumerate(all_notes):
-            original_text = note['text']
-            note_id = note['id']
+        for idx, citation in enumerate(unique_citations):
+            # Build search query from extracted citation
+            original_text = citation.raw_text or f"({citation.author}, {citation.year})"
             
             # Get multiple options for this citation
             try:
@@ -943,7 +948,8 @@ def process_author_date():
                 
                 citations.append({
                     'id': idx + 1,
-                    'note_id': note_id,
+                    'author': citation.author,
+                    'year': citation.year,
                     'original': original_text,
                     'options': formatted_options
                 })
@@ -953,7 +959,8 @@ def process_author_date():
                 # Still include the citation, just with no options
                 citations.append({
                     'id': idx + 1,
-                    'note_id': note_id,
+                    'author': citation.author,
+                    'year': citation.year,
                     'original': original_text,
                     'options': [],
                     'error': str(e)
@@ -1120,27 +1127,28 @@ def finalize_author_date():
             }), 404
         
         # Process the document with selected citations
-        from document_processor import WordDocumentProcessor
-        from io import BytesIO
+        # For author-date mode, we append a References section
+        from processors.author_date import append_references_section, deduplicate_references
         
-        processor = WordDocumentProcessor(BytesIO(original_bytes))
-        
-        # Update each note with its selected citation
+        # Collect formatted references from selected options
+        references = []
         for citation in citations:
-            note_id = citation.get('note_id')
-            formatted = citation.get('formatted') or citation.get('original')
-            
-            if note_id and formatted:
-                # Try endnote first, then footnote
-                if not processor.write_endnote(note_id, formatted):
-                    processor.write_footnote(note_id, formatted)
+            options = citation.get('options', [])
+            if options:
+                # Use selected option if available, otherwise first option
+                selected = citation.get('selected') or options[0]
+                formatted = selected.get('formatted', '')
+                if formatted:
+                    references.append(formatted)
         
-        # Save to buffer
-        doc_buffer = processor.save_to_buffer()
-        processor.cleanup()
+        # Deduplicate and sort references
+        references = deduplicate_references(references)
         
-        # Store processed document
-        processed_bytes = doc_buffer.read()
+        # Append references section to document
+        if references:
+            processed_bytes = append_references_section(original_bytes, references)
+        else:
+            processed_bytes = original_bytes
         sessions.set(session_id, 'processed_doc', processed_bytes)
         
         return jsonify({
