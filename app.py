@@ -771,7 +771,7 @@ def reference_lookup():
         
         # Search for metadata
         engine = AuthorDateEngine()
-        metadata, confidence = engine.search(author, year, second_author)
+        metadata = engine.search(author, year, second_author)  # Returns CitationMetadata or None
         
         if not metadata:
             return jsonify({
@@ -779,15 +779,16 @@ def reference_lookup():
                 'error': f'Could not find reference for {author} ({year})'
             }), 404
         
-        # Format the reference
+        # Format the reference using the processor's formatter
         from processors.author_date import AuthorDateProcessor
         processor = AuthorDateProcessor()
-        formatted = processor._format_reference(metadata, style)
+        formatter = processor._get_formatter(style)
+        formatted = formatter.format(metadata)
         
         return jsonify({
             'success': True,
             'formatted': formatted,
-            'confidence': confidence,
+            'confidence': metadata.confidence if metadata.confidence else 0.8,
             'metadata': metadata.to_dict() if metadata else None
         })
         
