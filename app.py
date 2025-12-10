@@ -4,6 +4,9 @@ citeflex/app.py
 Flask application for CiteFlex Unified.
 
 Version History:
+    2025-12-10: Added auto-finalize on download for author-date mode.
+                If user downloads without explicitly finalizing, the document
+                is automatically processed with selected/original citations.
     2025-12-10: Added /api/cite/parenthetical endpoint for Author-Date mode.
                 Returns multiple options for user selection.
     2025-12-06 13:30: Added debug logging to diagnose session loss issue
@@ -649,6 +652,34 @@ def download(session_id: str):
         
         processed_doc = session_data.get('processed_doc')
         filename = session_data.get('filename', 'processed.docx')
+        
+        # Auto-finalize for author-date mode if not already finalized
+        if not processed_doc and session_data.get('mode') == 'author-date':
+            print(f"[API] Auto-finalizing author-date session {session_id[:8]}...")
+            original_bytes = session_data.get('original_bytes')
+            citations = session_data.get('citations', [])
+            
+            if original_bytes:
+                from document_processor import WordDocumentProcessor
+                from io import BytesIO
+                
+                processor = WordDocumentProcessor(BytesIO(original_bytes))
+                
+                # Update each note with its selected/original citation
+                for citation in citations:
+                    note_id = citation.get('note_id')
+                    formatted = citation.get('formatted') or citation.get('original')
+                    
+                    if note_id and formatted:
+                        if not processor.write_endnote(note_id, formatted):
+                            processor.write_footnote(note_id, formatted)
+                
+                doc_buffer = processor.save_to_buffer()
+                processor.cleanup()
+                
+                processed_doc = doc_buffer.read()
+                sessions.set(session_id, 'processed_doc', processed_doc)
+                print(f"[API] Auto-finalized {len(citations)} citations")
         
         if not processed_doc:
             return jsonify({
