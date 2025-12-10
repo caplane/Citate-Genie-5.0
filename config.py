@@ -17,8 +17,18 @@ from typing import Dict
 # =============================================================================
 
 # AI/LLM API Keys (with .lstrip('=') to handle copy-paste artifacts)
-OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '').lstrip('=')
-ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '').lstrip('=')
+_raw_openai = os.environ.get('OPENAI_API_KEY', '')
+_raw_anthropic = os.environ.get('ANTHROPIC_API_KEY', '')
+OPENAI_API_KEY = _raw_openai.lstrip('=')
+ANTHROPIC_API_KEY = _raw_anthropic.lstrip('=')
+
+# Debug: Log if we stripped anything
+if _raw_openai.startswith('='):
+    print(f"[Config] WARNING: Stripped '=' from OPENAI_API_KEY. Raw started with: {_raw_openai[:10]}...")
+if _raw_openai and not _raw_openai.startswith('='):
+    print(f"[Config] OPENAI_API_KEY loaded OK (no '=' prefix). Starts with: {OPENAI_API_KEY[:10]}...")
+if not _raw_openai:
+    print("[Config] WARNING: OPENAI_API_KEY not set in environment")
 
 # Other API Keys
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
