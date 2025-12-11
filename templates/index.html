@@ -1023,6 +1023,11 @@
             
             if (!silent) {
                 showToast('Citation accepted');
+                
+                // Auto-advance to next citation if available
+                if (adActiveRefIndex < currentReferences.length - 1) {
+                    setTimeout(() => adNavigateCitation(1), 300);
+                }
             }
         }
         
@@ -1328,11 +1333,22 @@
             if (currentMode === 'author-date') {
                 showToast('Preparing document...');
                 
-                // Collect all references with their formatted text
-                const references = currentReferences.map(ref => ({
-                    original: ref.original,
-                    formatted: ref.formatted || ref.original
-                }));
+                // Auto-format any unaccepted references using first AI option
+                // This enables "trust mode" - user can download without reviewing
+                const references = [];
+                for (const ref of currentReferences) {
+                    let formatted = ref.formatted;
+                    
+                    if (!formatted && ref.options && ref.options.length > 1) {
+                        // Use first AI option (index 1, since 0 is "keep original")
+                        formatted = await formatMetadata(ref.options[1]);
+                    }
+                    
+                    references.push({
+                        original: ref.original,
+                        formatted: formatted || ref.original
+                    });
+                }
                 
                 try {
                     const res = await fetch('/api/finalize-author-date', {
