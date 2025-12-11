@@ -44,7 +44,8 @@ from functools import wraps
 from flask import Flask, request, jsonify, render_template, send_file
 from werkzeug.utils import secure_filename
 
-from unified_router import get_citation, get_multiple_citations, get_parenthetical_options
+from unified_router import get_citation, get_multiple_citations, get_parenthetical_options, get_parenthetical_metadata
+from formatters.base import get_formatter
 from document_processor import process_document
 
 # =============================================================================
@@ -549,6 +550,112 @@ def cite_parenthetical():
         }), 500
 
 
+@app.route('/api/format-citation', methods=['POST'])
+def format_citation():
+    """
+    Format a citation from raw metadata.
+    
+    Called when user clicks Accept & Save - this is when formatting happens.
+    
+    Request JSON:
+    {
+        "metadata": {
+            "title": "The Social Context of Genius",
+            "authors": ["Simonton, Dean Keith"],
+            "year": "1992",
+            "journal": "Psychological Bulletin",
+            "volume": "104",
+            "issue": "2",
+            "pages": "251-267",
+            "doi": "10.1037/0033-2909.104.2.251",
+            "citation_type": "journal"
+        },
+        "style": "APA 7"
+    }
+    
+    Response JSON:
+    {
+        "success": true,
+        "formatted": "Simonton, D. K. (1992). The social context..."
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        if not data or not data.get('metadata'):
+            return jsonify({
+                'success': False,
+                'error': 'Missing metadata'
+            }), 400
+        
+        meta_dict = data['metadata']
+        style = data.get('style', 'APA 7')
+        
+        # Handle "keep original" case
+        if meta_dict.get('is_original') or meta_dict.get('citation_type') == 'original':
+            # Return the original text as-is (no formatting needed)
+            return jsonify({
+                'success': True,
+                'formatted': meta_dict.get('title', '')  # title holds original text for this case
+            })
+        
+        # Convert dict to CitationMetadata
+        from models import CitationMetadata, CitationType
+        
+        # Map citation_type string to enum
+        type_map = {
+            'journal': CitationType.JOURNAL,
+            'book': CitationType.BOOK,
+            'legal': CitationType.LEGAL,
+            'interview': CitationType.INTERVIEW,
+            'letter': CitationType.LETTER,
+            'newspaper': CitationType.NEWSPAPER,
+            'government': CitationType.GOVERNMENT,
+            'medical': CitationType.MEDICAL,
+            'url': CitationType.URL,
+            'unknown': CitationType.UNKNOWN,
+        }
+        
+        citation_type = type_map.get(
+            meta_dict.get('citation_type', 'unknown').lower(),
+            CitationType.UNKNOWN
+        )
+        
+        metadata = CitationMetadata(
+            citation_type=citation_type,
+            title=meta_dict.get('title', ''),
+            authors=meta_dict.get('authors', []),
+            year=meta_dict.get('year', ''),
+            journal=meta_dict.get('journal', ''),
+            volume=meta_dict.get('volume', ''),
+            issue=meta_dict.get('issue', ''),
+            pages=meta_dict.get('pages', ''),
+            doi=meta_dict.get('doi', ''),
+            url=meta_dict.get('url', ''),
+            publisher=meta_dict.get('publisher', ''),
+            place=meta_dict.get('place', ''),
+            source_engine=meta_dict.get('source', 'manual')
+        )
+        
+        # Get formatter and format
+        formatter = get_formatter(style)
+        formatted = formatter.format(metadata)
+        
+        return jsonify({
+            'success': True,
+            'formatted': formatted
+        })
+        
+    except Exception as e:
+        print(f"[API] Error in /api/format-citation: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
 @app.route('/api/process', methods=['POST'])
 def process_doc():
     """
@@ -911,10 +1018,11 @@ def process_author_date():
         
         print(f"[API] Extracted {len(extracted_citations)} citations, {len(unique_citations)} unique")
         
-        # Process each citation to get options
-        citations = []
-        for idx, cite in enumerate(unique_citations):
-            # Build the original parenthetical string from extracted data
+        # Process citations in PARALLEL for speed
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        def process_single_citation(idx, cite):
+            """Process one citation - called in parallel. Returns raw metadata."""
             if cite.is_et_al:
                 original_text = f"({cite.author} et al., {cite.year})"
             elif cite.second_author:
@@ -922,75 +1030,97 @@ def process_author_date():
             else:
                 original_text = f"({cite.author}, {cite.year})"
             
-            note_id = idx + 1  # Use sequential ID since these aren't actual Word notes
+            note_id = idx + 1
             
-            # Get multiple options for this citation
             try:
-                options = get_parenthetical_options(original_text, style, limit=4)  # Get 4 AI options
+                # Get raw metadata (no formatting yet)
+                metadata_list = get_parenthetical_metadata(original_text, limit=4)
                 
-                # Build formatted options list
-                # Option 0: Original text (keep unchanged)
-                formatted_options = [{
+                # Build options with raw metadata
+                options = [{
                     'id': 0,
                     'title': '[Keep Original]',
-                    'formatted': original_text,
                     'authors': [],
                     'year': '',
                     'journal': '',
                     'publisher': '',
+                    'volume': '',
+                    'issue': '',
+                    'pages': '',
                     'doi': '',
+                    'url': '',
+                    'citation_type': 'original',
                     'source': 'original',
                     'is_original': True
                 }]
                 
-                # Options 1-4: AI lookup results
-                for opt_idx, (meta, formatted) in enumerate(options):
-                    formatted_options.append({
+                for opt_idx, meta in enumerate(metadata_list):
+                    options.append({
                         'id': opt_idx + 1,
                         'title': meta.title if meta else '',
-                        'formatted': formatted,
                         'authors': meta.authors if meta else [],
                         'year': meta.year if meta else '',
                         'journal': getattr(meta, 'journal', '') or '',
                         'publisher': getattr(meta, 'publisher', '') or '',
+                        'volume': getattr(meta, 'volume', '') or '',
+                        'issue': getattr(meta, 'issue', '') or '',
+                        'pages': getattr(meta, 'pages', '') or '',
                         'doi': getattr(meta, 'doi', '') or '',
-                        'source': getattr(meta, 'source_engine', 'Unknown'),
+                        'url': getattr(meta, 'url', '') or '',
+                        'citation_type': meta.citation_type.name.lower() if meta and meta.citation_type else 'unknown',
+                        'source': getattr(meta, 'source_engine', 'ai_lookup'),
                         'is_original': False
                     })
                 
-                # Recommendation = first AI result (option 1), or original if no AI results
-                recommendation = formatted_options[1]['formatted'] if len(formatted_options) > 1 else original_text
-                
-                citations.append({
+                return {
                     'id': idx + 1,
                     'note_id': note_id,
                     'original': original_text,
-                    'recommendation': recommendation,
-                    'options': formatted_options
-                })
+                    'options': options,
+                    'selected_option': 1 if len(options) > 1 else 0,  # Default to first AI result
+                    'formatted': None,  # Will be set when user accepts
+                    'accepted': False
+                }
                 
             except Exception as e:
-                print(f"[API] Error getting options for '{original_text[:40]}': {e}")
-                # Still include the citation with original as only option
-                citations.append({
+                print(f"[API] Error processing '{original_text[:40]}': {e}")
+                return {
                     'id': idx + 1,
                     'note_id': note_id,
                     'original': original_text,
-                    'recommendation': original_text,  # Fallback to original
                     'options': [{
                         'id': 0,
                         'title': '[Keep Original]',
-                        'formatted': original_text,
                         'authors': [],
                         'year': '',
                         'journal': '',
                         'publisher': '',
+                        'volume': '',
+                        'issue': '',
+                        'pages': '',
                         'doi': '',
+                        'url': '',
+                        'citation_type': 'original',
                         'source': 'original',
                         'is_original': True
                     }],
+                    'selected_option': 0,
+                    'formatted': None,
+                    'accepted': False,
                     'error': str(e)
-                })
+                }
+        
+        # Run lookups in parallel (up to 5 concurrent)
+        citations = [None] * len(unique_citations)
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(process_single_citation, idx, cite): idx 
+                for idx, cite in enumerate(unique_citations)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                citations[idx] = future.result()
+                print(f"[API] Completed citation {idx + 1}/{len(unique_citations)}")
         
         # Create session to store results
         session_id = sessions.create()
@@ -1008,8 +1138,8 @@ def process_author_date():
             'citations': citations,
             'stats': {
                 'total': len(citations),
-                'with_options': sum(1 for c in citations if c.get('options')),
-                'no_options': sum(1 for c in citations if not c.get('options'))
+                'with_options': sum(1 for c in citations if len(c.get('options', [])) > 1),
+                'no_options': sum(1 for c in citations if len(c.get('options', [])) <= 1)
             }
         })
         
