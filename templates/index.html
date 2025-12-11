@@ -64,6 +64,7 @@
         .status-pending { border-left: 3px solid #94a3b8; }
         .status-success { border-left: 3px solid #22c55e; background: #f0fdf4; }
         .status-error { border-left: 3px solid #ef4444; background: #fef2f2; }
+        .status-pending { border-left: 3px solid #f59e0b; background: #fffbeb; }
         .status-active { border-left: 3px solid #3b82f6; background: #eff6ff; }
         
         /* Mode toggle */
@@ -347,69 +348,63 @@
             <div id="author-date-results" class="hidden flex-1 overflow-y-auto p-6 lg:p-8">
                 <div class="max-w-4xl mx-auto w-full space-y-6 animate-fade-in">
                     
-                    <!-- Stats Summary -->
+                    <!-- Original Citation Card -->
                     <div class="bg-white p-6 rounded-xl shadow-sm border border-gray-200">
-                        <div class="flex items-center justify-between mb-4">
-                            <h3 class="text-lg font-bold text-gray-800">
-                                <i class="fas fa-list-ul text-blue-500 mr-2"></i> Generated References
+                        <div class="flex justify-between items-center mb-3">
+                            <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider flex items-center gap-2">
+                                <i class="fas fa-file-alt text-gray-300"></i> Original Citation
                             </h3>
-                            <div class="flex items-center gap-3">
-                                <span id="ad-stats" class="text-sm text-gray-500">
-                                    <span class="text-green-600 font-medium" id="ad-resolved">0</span> resolved, 
-                                    <span class="text-red-500 font-medium" id="ad-failed">0</span> failed
-                                </span>
+                            <div class="flex items-center gap-2">
+                                <span id="ad-active-type" class="text-[10px] font-bold uppercase px-2 py-0.5 rounded badge-unknown">detecting...</span>
+                                <span id="ad-active-id" class="text-xs font-mono text-gray-400">Ref #</span>
                             </div>
                         </div>
-                        
-                        <p class="text-sm text-gray-500 mb-4">
-                            Click any reference below to edit. The References section has been appended to your document.
-                        </p>
-                        
-                        <!-- Reference List -->
-                        <div id="reference-list" class="space-y-3">
-                            <!-- References will be inserted here -->
-                        </div>
+                        <div id="ad-active-original" class="text-gray-800 serif italic p-4 bg-gradient-to-br from-gray-50 to-slate-50 rounded-lg border border-gray-100 leading-relaxed text-lg"></div>
                     </div>
-                    
-                    <!-- Reference Preview -->
-                    <div id="reference-preview" class="hidden bg-white p-6 rounded-xl shadow-sm border-2 border-blue-200">
+
+                    <!-- Final Editor -->
+                    <div class="bg-white p-6 rounded-xl shadow-sm border-2 border-blue-200 ring-2 ring-blue-50">
                         <h3 class="text-xs font-bold text-blue-600 uppercase mb-3 flex items-center gap-2">
-                            <i class="fas fa-edit"></i> Edit Reference
+                            <i class="fas fa-pen-nib"></i> Final Citation
+                            <span class="text-[10px] font-normal text-gray-400 ml-2">(select option below or edit manually)</span>
                         </h3>
-                        <div class="mb-3 p-3 bg-gray-50 rounded-lg flex items-center justify-between">
-                            <div>
-                                <span class="text-xs text-gray-500">Citation:</span>
-                                <span id="preview-citation" class="text-sm font-medium text-gray-700 ml-2">(Author, Year)</span>
-                            </div>
-                            <button onclick="lookupParenthetical()" id="ai-lookup-btn" class="text-xs bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 text-white px-3 py-1.5 rounded-lg transition-all flex items-center gap-1.5">
-                                <i class="fas fa-magic"></i> AI Lookup
-                            </button>
-                        </div>
+                        <textarea id="ad-final-edit-area" class="w-full p-4 border border-gray-300 rounded-lg serif text-base focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none resize-y min-h-[120px] leading-relaxed" placeholder="Select an option below or type manually..."></textarea>
                         
-                        <!-- AI Options Container -->
-                        <div id="ai-options-container" class="hidden mb-4">
-                            <div class="flex items-center justify-between mb-2">
-                                <h4 class="text-xs font-bold text-purple-600 uppercase flex items-center gap-2">
-                                    <i class="fas fa-robot"></i> AI-Powered Matches
-                                </h4>
-                                <span class="text-xs text-gray-400">Select the correct work</span>
-                            </div>
-                            <div id="ai-options-list" class="space-y-2 max-h-64 overflow-y-auto">
-                                <!-- Options will be inserted here -->
-                            </div>
-                        </div>
-                        
-                        <textarea id="reference-edit-area" class="w-full p-4 border border-gray-300 rounded-lg serif text-base focus:ring-2 focus:ring-blue-500 focus:border-blue-500 outline-none resize-y min-h-[100px] leading-relaxed"></textarea>
-                        <div class="flex gap-3 mt-4">
-                            <button onclick="saveReference()" class="flex-1 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white font-medium py-2.5 rounded-lg transition-all">
-                                <i class="fas fa-check mr-2"></i> Save Changes
+                        <div class="flex gap-3 mt-4 pt-4 border-t border-gray-100">
+                            <button onclick="adCommitChange()" id="ad-commit-btn" class="flex-1 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white font-medium py-3 rounded-lg transition-all shadow-sm flex items-center justify-center gap-2">
+                                <i class="fas fa-check"></i> Accept & Save
                             </button>
-                            <button onclick="closeReferencePreview()" class="px-4 py-2.5 bg-gray-100 hover:bg-gray-200 text-gray-700 font-medium rounded-lg transition-colors">
-                                Cancel
+                            <button onclick="adCopyToClipboard()" class="px-5 py-3 bg-white text-gray-700 font-medium rounded-lg hover:bg-gray-50 transition-colors border border-gray-200 shadow-sm flex items-center gap-2 tooltip" data-tip="Copy to clipboard">
+                                <i class="fas fa-copy text-gray-400"></i>
                             </button>
                         </div>
                     </div>
+
+                    <!-- Alternative Resolutions Section -->
+                    <div id="ad-candidates-section">
+                        <div class="flex justify-between items-center mb-3">
+                            <h3 class="text-xs font-bold text-gray-400 uppercase tracking-wider flex items-center gap-2">
+                                <i class="fas fa-magic text-gray-300"></i> Alternative Resolutions
+                            </h3>
+                            <span id="ad-options-count" class="text-xs text-gray-400">0 options</span>
+                        </div>
+                        
+                        <div id="ad-candidates-list" class="space-y-3">
+                            <!-- Candidates will be inserted here -->
+                        </div>
+                    </div>
                     
+                    <!-- Navigation -->
+                    <div class="flex justify-between items-center pt-2">
+                        <button onclick="adNavigateCitation(-1)" id="ad-prev-btn" class="text-sm text-gray-500 hover:text-gray-700 flex items-center gap-1 disabled:opacity-30 disabled:cursor-not-allowed">
+                            <i class="fas fa-arrow-left"></i> Previous
+                        </button>
+                        <span id="ad-nav-position" class="text-xs text-gray-400">1 of 10</span>
+                        <button onclick="adNavigateCitation(1)" id="ad-next-btn" class="text-sm text-gray-500 hover:text-gray-700 flex items-center gap-1 disabled:opacity-30 disabled:cursor-not-allowed">
+                            Next <i class="fas fa-arrow-right"></i>
+                        </button>
+                    </div>
+
                 </div>
             </div>
         </section>
@@ -429,6 +424,7 @@
         let activeNoteId = null;
         let activeNoteIndex = -1;
         let activeRefIndex = -1;
+        let adActiveRefIndex = -1;  // Author-Date mode active reference
         let sessionId = null;
         let successCount = 0;
         let documentStyle = 'Chicago Manual of Style';
@@ -667,8 +663,9 @@
                     sessionId = data.session_id;
                     
                     // Transform citations from backend into references format for UI
+                    // Now using raw metadata (formatting happens on Accept & Save)
                     currentReferences = (data.citations || []).map(citation => {
-                        // Parse "(Author, Year)" or "(Author & Author2, Year)" or "(Author et al., Year)"
+                        // Parse "(Author, Year)" from original text
                         const original = citation.original || '';
                         const match = original.match(/\(([^,]+?)(?:\s+et\s+al\.)?(?:\s*[&,]\s*([^,]+?))?,\s*(\d{4}[a-z]?)\)/i);
                         
@@ -680,11 +677,8 @@
                             isEtAl = /et\s+al/i.test(original);
                         }
                         
-                        // Get the best formatted citation (recommendation or first AI option)
+                        // Check if AI lookup succeeded (more than just the original option)
                         const hasOptions = citation.options && citation.options.length > 1;
-                        const formatted = citation.recommendation || 
-                                         (hasOptions ? citation.options[1]?.formatted : '') || 
-                                         original;
                         
                         return {
                             id: citation.id,
@@ -695,9 +689,10 @@
                             year: year,
                             is_et_al: isEtAl,
                             found: hasOptions,
-                            formatted: formatted,
-                            confidence: hasOptions ? 0.85 : 0,
-                            options: citation.options || []
+                            options: citation.options || [],
+                            selected_option: citation.selected_option || (hasOptions ? 1 : 0),
+                            formatted: null,  // Will be set on Accept & Save
+                            accepted: false
                         };
                     });
                     
@@ -706,19 +701,18 @@
                     fileInfo.classList.remove('hidden');
                     document.getElementById('download-area').classList.remove('hidden');
                     
-                    // Update stats (map backend field names to frontend)
-                    const resolved = data.stats?.with_options || 0;
-                    const failed = data.stats?.no_options || 0;
-                    document.getElementById('ad-resolved').textContent = resolved;
-                    document.getElementById('ad-failed').textContent = failed;
-                    
-                    renderReferenceList();
+                    // Render sidebar
                     renderReferenceSidebar();
                     
-                    // Show author-date results
+                    // Show author-date results with first reference loaded
                     document.getElementById('editor-empty').classList.add('hidden');
                     document.getElementById('editor-active').classList.add('hidden');
                     document.getElementById('author-date-results').classList.remove('hidden');
+                    
+                    // Load first reference into editor
+                    if (currentReferences.length > 0) {
+                        adLoadEditor(0);
+                    }
                     
                 } else {
                     alert('Error: ' + (data.error || 'Failed to process document'));
@@ -776,219 +770,273 @@
             
             empty.classList.add('hidden');
             list.innerHTML = currentReferences.map((ref, idx) => {
-                const statusClass = ref.found ? 'status-success' : 'status-error';
-                const icon = ref.found ? 'fa-check text-green-500' : 'fa-exclamation-triangle text-red-500';
+                const isActive = idx === adActiveRefIndex;
+                const statusClass = ref.accepted ? 'status-success' : (ref.found ? 'status-pending' : 'status-error');
+                const icon = ref.accepted ? 'fa-check text-green-500' : 
+                            (ref.found ? 'fa-clock text-yellow-500' : 'fa-exclamation-triangle text-red-500');
                 const citationText = ref.is_et_al 
                     ? `${ref.author} et al. (${ref.year})`
                     : ref.second_author 
                         ? `${ref.author} & ${ref.second_author} (${ref.year})`
                         : `${ref.author} (${ref.year})`;
+                        
+                // Get preview text (truncated formatted or title from selected option)
+                let previewText = 'Pending...';
+                if (ref.formatted) {
+                    previewText = ref.formatted.replace(/<\/?i>/g, '').substring(0, 50) + '...';
+                } else if (ref.options && ref.options[ref.selected_option || 1]) {
+                    const opt = ref.options[ref.selected_option || 1];
+                    previewText = opt.title ? opt.title.substring(0, 50) + '...' : 'Click to resolve';
+                }
+                
                 return `
-                    <div onclick="selectReference(${idx})" 
-                         class="p-3 cursor-pointer hover:bg-gray-50 transition-colors ${statusClass}">
+                    <div id="ref-${ref.id}" onclick="adSelectReference(${idx})" 
+                         class="p-3 cursor-pointer hover:bg-gray-50 transition-colors ${statusClass} ${isActive ? 'status-active' : ''}">
                         <div class="flex items-center justify-between mb-1">
                             <span class="text-xs font-medium text-gray-600">${citationText}</span>
                             <i class="fas ${icon}"></i>
                         </div>
-                        <p class="text-xs text-gray-500 truncate">
-                            ${ref.formatted ? ref.formatted.substring(0, 50) + '...' : 'Not found'}
-                        </p>
+                        <p class="text-xs text-gray-500 truncate">${previewText}</p>
                     </div>
                 `;
             }).join('');
         }
         
-        function renderReferenceList() {
-            const container = document.getElementById('reference-list');
-            container.innerHTML = currentReferences.map((ref, idx) => {
-                const statusClass = ref.found ? 'resolved' : 'failed';
-                const citationText = ref.is_et_al 
-                    ? `${ref.author} et al. (${ref.year})`
-                    : ref.second_author 
-                        ? `${ref.author} & ${ref.second_author} (${ref.year})`
-                        : `${ref.author} (${ref.year})`;
-                return `
-                    <div class="reference-item ${statusClass}" onclick="editReference(${idx})">
-                        <div class="flex items-center justify-between mb-2">
-                            <span class="text-xs font-medium text-gray-500 bg-gray-100 px-2 py-0.5 rounded">${citationText}</span>
-                            ${ref.found 
-                                ? `<span class="text-xs text-green-600"><i class="fas fa-check mr-1"></i>${Math.round(ref.confidence * 100)}% match</span>`
-                                : `<span class="text-xs text-red-500"><i class="fas fa-exclamation-triangle mr-1"></i>Not found</span>`
-                            }
-                        </div>
-                        <p class="text-sm serif text-gray-700 leading-relaxed">
-                            ${ref.formatted || '<em class="text-gray-400">Click to add manually</em>'}
-                        </p>
-                    </div>
-                `;
-            }).join('');
+        // ========== AUTHOR-DATE EDITOR ==========
+        
+        function adSelectReference(idx) {
+            // Auto-save current if not accepted and has content
+            if (adActiveRefIndex >= 0 && adActiveRefIndex !== idx) {
+                const currentRef = currentReferences[adActiveRefIndex];
+                const textarea = document.getElementById('ad-final-edit-area');
+                if (textarea && textarea.value.trim() && !currentRef.accepted) {
+                    // Auto-accept current before moving
+                    adCommitChange(true);  // silent = true
+                }
+            }
+            adLoadEditor(idx);
         }
         
-        function selectReference(idx) {
-            activeRefIndex = idx;
-            editReference(idx);
-        }
-        
-        function editReference(idx) {
-            activeRefIndex = idx;
+        function adLoadEditor(idx) {
+            adActiveRefIndex = idx;
             const ref = currentReferences[idx];
             
-            const citationText = ref.is_et_al 
-                ? `${ref.author} et al. (${ref.year})`
-                : ref.second_author 
-                    ? `${ref.author} & ${ref.second_author} (${ref.year})`
-                    : `${ref.author} (${ref.year})`;
+            // Update sidebar highlighting
+            document.querySelectorAll('#citation-list > div').forEach(el => {
+                el.classList.remove('status-active');
+            });
+            const activeEl = document.getElementById(`ref-${ref.id}`);
+            if (activeEl) activeEl.classList.add('status-active');
             
-            document.getElementById('preview-citation').textContent = citationText;
-            document.getElementById('reference-edit-area').value = ref.formatted || '';
-            document.getElementById('reference-preview').classList.remove('hidden');
+            // Populate Original Citation
+            document.getElementById('ad-active-id').innerText = `Ref ${ref.id}`;
+            document.getElementById('ad-active-original').innerText = ref.original;
             
-            // Scroll to preview
-            document.getElementById('reference-preview').scrollIntoView({ behavior: 'smooth' });
-        }
-        
-        function closeReferencePreview() {
-            document.getElementById('reference-preview').classList.add('hidden');
-            document.getElementById('ai-options-container').classList.add('hidden');
-            activeRefIndex = -1;
-        }
-        
-        // ========== AI PARENTHETICAL LOOKUP ==========
-        async function lookupParenthetical() {
-            if (activeRefIndex < 0) return;
+            // Set type badge from selected option
+            const typeEl = document.getElementById('ad-active-type');
+            const selectedOpt = ref.options[ref.selected_option || 1] || ref.options[0];
+            const citationType = selectedOpt?.citation_type || 'unknown';
+            typeEl.innerText = citationType;
+            typeEl.className = `text-[10px] font-bold uppercase px-2 py-0.5 rounded badge-${citationType}`;
             
-            const ref = currentReferences[activeRefIndex];
-            const btn = document.getElementById('ai-lookup-btn');
-            const container = document.getElementById('ai-options-container');
-            const list = document.getElementById('ai-options-list');
-            
-            // Build the parenthetical citation string
-            let citationText;
-            if (ref.is_et_al) {
-                citationText = `(${ref.author} et al., ${ref.year})`;
-            } else if (ref.second_author) {
-                citationText = `(${ref.author} & ${ref.second_author}, ${ref.year})`;
+            // Populate Final Citation textarea
+            const textarea = document.getElementById('ad-final-edit-area');
+            if (ref.formatted) {
+                // Already formatted - show it
+                textarea.value = ref.formatted;
             } else {
-                citationText = `(${ref.author}, ${ref.year})`;
+                // Not yet formatted - show empty or placeholder
+                textarea.value = '';
+                textarea.placeholder = 'Select an option below, or type manually...';
             }
             
-            // Show loading state
-            const originalHtml = btn.innerHTML;
-            btn.innerHTML = '<div class="loader w-3 h-3"></div>';
-            btn.disabled = true;
+            // Render alternative options
+            adRenderCandidates(ref);
             
-            container.classList.remove('hidden');
-            list.innerHTML = `
-                <div class="flex items-center justify-center py-6 text-gray-400">
-                    <div class="loader mr-2"></div> Searching with AI...
-                </div>
-            `;
+            // Update navigation
+            adUpdateNavigation();
+        }
+        
+        function adRenderCandidates(ref) {
+            const container = document.getElementById('ad-candidates-list');
+            const countEl = document.getElementById('ad-options-count');
             
-            try {
-                const res = await fetch('/api/cite/parenthetical', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        query: citationText,
-                        style: documentStyle,
-                        limit: 5
-                    })
-                });
-                
-                const data = await res.json();
-                
-                if (data.success && data.options && data.options.length > 0) {
-                    // Store options for selection
-                    window.aiOptions = data.options;
-                    
-                    // Render as radio buttons
-                    list.innerHTML = data.options.map((opt, i) => `
-                        <label class="block p-3 bg-gray-50 rounded-lg border border-gray-200 hover:border-purple-400 hover:bg-purple-50 cursor-pointer transition-all">
-                            <div class="flex items-start gap-3">
-                                <input type="radio" name="ai-option" value="${i}" onchange="selectAiOption(${i})" 
-                                       class="mt-1 w-4 h-4 text-purple-600 focus:ring-purple-500">
-                                <div class="flex-1">
-                                    <div class="flex items-center justify-between mb-1">
-                                        <span class="text-xs font-medium text-purple-700">${opt.title ? opt.title.substring(0, 60) + (opt.title.length > 60 ? '...' : '') : 'Unknown title'}</span>
-                                        <span class="text-[10px] px-1.5 py-0.5 rounded ${opt.confidence === 'high' ? 'bg-green-100 text-green-700' : opt.confidence === 'medium' ? 'bg-yellow-100 text-yellow-700' : 'bg-gray-100 text-gray-600'}">${opt.confidence}</span>
-                                    </div>
-                                    <p class="text-sm text-gray-600 serif leading-relaxed">${opt.citation}</p>
-                                </div>
-                            </div>
-                        </label>
-                    `).join('');
-                } else {
-                    list.innerHTML = `
-                        <div class="text-center py-6 text-gray-400">
-                            <i class="fas fa-search text-2xl mb-2 opacity-30"></i>
-                            <p class="text-sm">No matches found for ${citationText}</p>
-                            <p class="text-xs mt-1">Try editing the reference manually</p>
-                        </div>
-                    `;
-                }
-            } catch (err) {
-                console.error(err);
-                list.innerHTML = `
-                    <div class="text-center py-6 text-red-400">
-                        <i class="fas fa-exclamation-circle text-2xl mb-2"></i>
-                        <p class="text-sm">AI lookup failed</p>
-                        <p class="text-xs mt-1">${err.message || 'Please try again'}</p>
+            // Filter to non-original options
+            const options = ref.options.filter(opt => !opt.is_original);
+            countEl.innerText = `${options.length} option${options.length !== 1 ? 's' : ''}`;
+            
+            if (options.length === 0) {
+                container.innerHTML = `
+                    <div class="text-center py-6 text-gray-400 bg-white rounded-lg border border-gray-200">
+                        <i class="fas fa-search text-2xl mb-2 opacity-30"></i>
+                        <p class="text-sm">No matches found</p>
+                        <p class="text-xs mt-1">Type the citation manually above</p>
                     </div>
                 `;
-            } finally {
-                btn.innerHTML = originalHtml;
-                btn.disabled = false;
+                return;
             }
+            
+            container.innerHTML = options.map((opt, idx) => {
+                const actualIdx = idx + 1;  // +1 because we skipped the original option
+                const isSelected = actualIdx === ref.selected_option;
+                const typeBadgeClass = `badge-${opt.citation_type || 'unknown'}`;
+                
+                // Build author string
+                let authorStr = '';
+                if (opt.authors && opt.authors.length > 0) {
+                    if (opt.authors.length === 1) {
+                        authorStr = opt.authors[0];
+                    } else if (opt.authors.length === 2) {
+                        authorStr = opt.authors.join(' & ');
+                    } else {
+                        authorStr = opt.authors[0] + ' et al.';
+                    }
+                }
+                
+                // Build details line
+                let details = [];
+                if (opt.journal) details.push(`<em>${opt.journal}</em>`);
+                if (opt.publisher) details.push(opt.publisher);
+                if (opt.volume) details.push(`Vol. ${opt.volume}`);
+                if (opt.year) details.push(opt.year);
+                const detailsStr = details.join(' · ');
+                
+                return `
+                    <div onclick="adSelectCandidate(${actualIdx})" 
+                         class="p-4 bg-white rounded-lg border ${isSelected ? 'border-blue-400 ring-2 ring-blue-100' : 'border-gray-200'} hover:border-blue-300 cursor-pointer transition-all">
+                        <div class="flex items-start justify-between mb-2">
+                            <div class="flex items-center gap-2">
+                                <span class="text-[10px] font-bold uppercase px-2 py-0.5 rounded ${typeBadgeClass}">${opt.citation_type || 'unknown'}</span>
+                                ${opt.source ? `<span class="text-[10px] text-gray-400">${opt.source}</span>` : ''}
+                            </div>
+                            ${isSelected ? '<i class="fas fa-check-circle text-blue-500"></i>' : ''}
+                        </div>
+                        <p class="font-medium text-gray-800 mb-1">${opt.title || 'Untitled'}</p>
+                        <p class="text-sm text-gray-600">${authorStr}${authorStr && detailsStr ? ' · ' : ''}${detailsStr}</p>
+                        ${opt.doi ? `<p class="text-xs text-blue-600 mt-1">DOI: ${opt.doi}</p>` : ''}
+                    </div>
+                `;
+            }).join('');
         }
         
-        function selectAiOption(idx) {
-            if (window.aiOptions && window.aiOptions[idx]) {
-                document.getElementById('reference-edit-area').value = window.aiOptions[idx].citation;
-            }
+        async function adSelectCandidate(optIdx) {
+            if (adActiveRefIndex < 0) return;
+            
+            const ref = currentReferences[adActiveRefIndex];
+            ref.selected_option = optIdx;
+            
+            // Get the selected option metadata
+            const opt = ref.options[optIdx];
+            if (!opt) return;
+            
+            // Format the citation via backend
+            const formatted = await formatMetadata(opt);
+            
+            // Put in textarea
+            document.getElementById('ad-final-edit-area').value = formatted;
+            
+            // Re-render to show selection
+            adRenderCandidates(ref);
         }
         
-        async function saveReference() {
-            if (activeRefIndex < 0) return;
-            
-            const newFormatted = document.getElementById('reference-edit-area').value.trim();
-            
+        async function formatMetadata(metadata) {
             try {
-                const res = await fetch('/api/update-reference', {
+                const res = await fetch('/api/format-citation', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        session_id: sessionId,
-                        index: activeRefIndex,
-                        formatted: newFormatted
+                        metadata: metadata,
+                        style: documentStyle
                     })
                 });
                 
                 const data = await res.json();
                 
                 if (data.success) {
-                    // Update local state
-                    currentReferences[activeRefIndex].formatted = newFormatted;
-                    currentReferences[activeRefIndex].found = true;
-                    
-                    // Re-render
-                    renderReferenceList();
-                    renderReferenceSidebar();
-                    
-                    // Update stats
-                    const resolved = currentReferences.filter(r => r.found).length;
-                    const failed = currentReferences.length - resolved;
-                    document.getElementById('ad-resolved').textContent = resolved;
-                    document.getElementById('ad-failed').textContent = failed;
-                    
-                    closeReferencePreview();
-                    showToast('Reference updated successfully');
+                    return data.formatted;
                 } else {
-                    alert('Failed to save: ' + data.error);
+                    console.error('Format error:', data.error);
+                    return '';
                 }
             } catch (err) {
-                console.error(err);
-                alert('Failed to save reference');
+                console.error('Format error:', err);
+                return '';
             }
+        }
+        
+        async function adCommitChange(silent = false) {
+            if (adActiveRefIndex < 0) return;
+            
+            const ref = currentReferences[adActiveRefIndex];
+            const textarea = document.getElementById('ad-final-edit-area');
+            let finalText = textarea.value.trim();
+            
+            // If empty, try to format the selected option
+            if (!finalText && ref.options[ref.selected_option]) {
+                finalText = await formatMetadata(ref.options[ref.selected_option]);
+                textarea.value = finalText;
+            }
+            
+            // If still empty and has options, format the first AI option
+            if (!finalText && ref.options.length > 1) {
+                finalText = await formatMetadata(ref.options[1]);
+                textarea.value = finalText;
+            }
+            
+            // If still empty, use original
+            if (!finalText) {
+                finalText = ref.original;
+            }
+            
+            // Save to local state
+            ref.formatted = finalText;
+            ref.accepted = true;
+            
+            // Update sidebar
+            renderReferenceSidebar();
+            
+            if (!silent) {
+                showToast('Citation accepted');
+            }
+        }
+        
+        async function adNavigateCitation(delta) {
+            // Auto-save current before navigating
+            if (adActiveRefIndex >= 0) {
+                const currentRef = currentReferences[adActiveRefIndex];
+                const textarea = document.getElementById('ad-final-edit-area');
+                
+                // If there's content in textarea and not yet accepted, auto-accept
+                if (textarea.value.trim() || currentRef.options.length > 1) {
+                    await adCommitChange(true);  // silent = true
+                }
+            }
+            
+            const newIdx = adActiveRefIndex + delta;
+            if (newIdx >= 0 && newIdx < currentReferences.length) {
+                adLoadEditor(newIdx);
+            }
+        }
+        
+        function adUpdateNavigation() {
+            document.getElementById('ad-nav-position').innerText = `${adActiveRefIndex + 1} of ${currentReferences.length}`;
+            document.getElementById('ad-prev-btn').disabled = adActiveRefIndex <= 0;
+            document.getElementById('ad-next-btn').disabled = adActiveRefIndex >= currentReferences.length - 1;
+        }
+        
+        function adCopyToClipboard() {
+            const textarea = document.getElementById('ad-final-edit-area');
+            navigator.clipboard.writeText(textarea.value).then(() => {
+                showToast('Copied to clipboard');
+            }).catch(err => {
+                console.error('Copy failed:', err);
+            });
+        }
+        
+        // Helper to render HTML with italics
+        function renderWithItalics(text) {
+            if (!text) return '';
+            return text.replace(/<i>/g, '<em>').replace(/<\/i>/g, '</em>');
         }
 
         // ========== FOOTNOTE EDITOR ==========
@@ -1271,13 +1319,25 @@
                 e.preventDefault();
                 if (currentMode === 'footnote') {
                     commitChange();
-                } else if (activeRefIndex >= 0) {
-                    saveReference();
+                } else if (adActiveRefIndex >= 0) {
+                    adCommitChange();
                 }
             }
             if (e.target.tagName !== 'TEXTAREA' && e.target.tagName !== 'INPUT') {
-                if (e.key === 'ArrowLeft') navigateCitation(-1);
-                if (e.key === 'ArrowRight') navigateCitation(1);
+                if (e.key === 'ArrowLeft') {
+                    if (currentMode === 'footnote') {
+                        navigateCitation(-1);
+                    } else {
+                        adNavigateCitation(-1);
+                    }
+                }
+                if (e.key === 'ArrowRight') {
+                    if (currentMode === 'footnote') {
+                        navigateCitation(1);
+                    } else {
+                        adNavigateCitation(1);
+                    }
+                }
             }
         });
     </script>
