@@ -902,22 +902,27 @@ def process_author_date():
         # Read file bytes
         file_bytes = file.read()
         
-        # Extract citations from document
-        from document_processor import WordDocumentProcessor
-        from io import BytesIO
+        # Extract author-date citations from document BODY TEXT
+        from processors.author_year_extractor import AuthorDateExtractor
         
-        processor = WordDocumentProcessor(BytesIO(file_bytes))
-        endnotes = processor.get_endnotes()
-        footnotes = processor.get_footnotes()
-        processor.cleanup()
+        extractor = AuthorDateExtractor()
+        extracted_citations = extractor.extract_citations_from_docx(file_bytes)
+        unique_citations = extractor.get_unique_citations(extracted_citations)
         
-        all_notes = endnotes + footnotes
+        print(f"[API] Extracted {len(extracted_citations)} citations, {len(unique_citations)} unique")
         
         # Process each citation to get options
         citations = []
-        for idx, note in enumerate(all_notes):
-            original_text = note['text']
-            note_id = note['id']
+        for idx, cite in enumerate(unique_citations):
+            # Build the original parenthetical string from extracted data
+            if cite.is_et_al:
+                original_text = f"({cite.author} et al., {cite.year})"
+            elif cite.second_author:
+                original_text = f"({cite.author} & {cite.second_author}, {cite.year})"
+            else:
+                original_text = f"({cite.author}, {cite.year})"
+            
+            note_id = idx + 1  # Use sequential ID since these aren't actual Word notes
             
             # Get multiple options for this citation
             try:
@@ -1000,11 +1005,11 @@ def process_author_date():
         return jsonify({
             'success': True,
             'session_id': session_id,
-            'references': citations,  # Frontend expects 'references' not 'citations'
+            'citations': citations,
             'stats': {
                 'total': len(citations),
-                'resolved': sum(1 for c in citations if c.get('options')),  # Frontend expects 'resolved'
-                'failed': sum(1 for c in citations if not c.get('options'))  # Frontend expects 'failed'
+                'with_options': sum(1 for c in citations if c.get('options')),
+                'no_options': sum(1 for c in citations if not c.get('options'))
             }
         })
         
