@@ -60,8 +60,13 @@ class AuthorDateExtractor:
     
     # Pattern components
     # Author name: Capitalized word, may include hyphenated names, apostrophes, Unicode
-    # Simplified to be more reliable - complex surnames handled via pre-processing if needed
-    AUTHOR_NAME = r"[A-Z\u00C0-\u024F][a-zA-Z\u00C0-\u024F'''\-]+"
+    # Supports lowercase prefixes: van, de, von, den, der, la, le, di, da, dos, das, del, della
+    # Supports suffixes: Jr., Sr., III, IV, etc.
+    # Examples: van Gogh, de Silva, von Neumann, Smith Jr., Williams III
+    AUTHOR_PREFIX = r"(?:(?:van|de|von|den|der|la|le|di|da|dos|das|del|della|du|el|al|bin|ibn)\s+)?"
+    AUTHOR_CORE = r"[A-Z\u00C0-\u024F][a-zA-Z\u00C0-\u024F'''\-]+"
+    AUTHOR_SUFFIX = r"(?:\s+(?:Jr\.?|Sr\.?|III|IV|V|2nd|3rd))?"
+    AUTHOR_NAME = rf"{AUTHOR_PREFIX}{AUTHOR_CORE}{AUTHOR_SUFFIX}"
     
     # Year: 4 digits, optional letter suffix, "n.d.", or "in press"
     YEAR = r"(?:\d{4}[a-z]?|n\.d\.|in\s+press)"
@@ -71,6 +76,30 @@ class AuthorDateExtractor:
     
     # "et al." variations
     ET_AL = r"et\s+al\.?"
+    
+    # ==========================================================================
+    # EDGE CASE PATTERNS (Added 2025-12-11)
+    # ==========================================================================
+    
+    # Trigger words that precede narrative citations without parenthetical author
+    # Examples: "the textbook by Smith (2020)", "see the article by Jones (2019)"
+    TRIGGER_WORDS = r"(?:textbooks?|books?|articles?|stud(?:y|ies)|papers?|works?|reviews?|volumes?|monographs?|surveys?)"
+    
+    # Citation prefixes that appear inside parentheses
+    # Examples: (see Smith, 2020), (cf. Jones, 2019), (e.g., Williams, 2018)
+    CITATION_PREFIX = r"(?:see\s+|cf\.?\s+|e\.g\.,?\s+|i\.e\.,?\s+|also\s+|but\s+see\s+)"
+    
+    # Corporate/organizational author names (multi-word capitalized entities)
+    # Examples: American Psychological Association, World Health Organization
+    # Pattern: 2+ capitalized words, optionally with "of", "for", "and", "the" connectors
+    CORPORATE_CONNECTORS = r"(?:\s+(?:of|for|and|the|on|&)\s+)"
+    CORPORATE_WORD = r"[A-Z][a-zA-Z]+"
+    CORPORATE_AUTHOR = rf"(?:{CORPORATE_WORD}(?:{CORPORATE_CONNECTORS}|(?:\s+{CORPORATE_WORD}))+)"
+    
+    # Author chain for trigger-word citations (multi-author without leading paren)
+    # Examples: "textbooks... Bernstein, Clarke-Stewart, Penner, Roy, & Wickens (2000)"
+    # Matches: Surname1, Surname2, ... and/& SurnameN (YEAR)
+    AUTHOR_CHAIN = rf"({AUTHOR_NAME}(?:\s*,\s*{AUTHOR_NAME})*(?:\s*,?\s*(?:and|&)\s*{AUTHOR_NAME})?)"
     
     # Patterns for different citation formats
     PATTERNS = [
@@ -146,7 +175,60 @@ class AuthorDateExtractor:
             rf'\(({AUTHOR_NAME})\s*,\s*({YEAR}(?:\s*,\s*{YEAR})+)\)',
             re.UNICODE
         ),
+        
+        # [PATTERN 11] (see Author, Year) - prefixed parenthetical citation
+        # e.g., "(see Smith, 2020)", "(cf. Jones, 2019)", "(e.g., Williams, 2018)"
+        re.compile(
+            rf'\({CITATION_PREFIX}({AUTHOR_NAME})\s*,\s*({YEAR})(?:,?\s*{PAGE})?\)',
+            re.UNICODE
+        ),
+        
+        # [PATTERN 12] (see Author & Author, Year) - prefixed two-author parenthetical
+        re.compile(
+            rf'\({CITATION_PREFIX}({AUTHOR_NAME})\s*(?:&|and)\s*({AUTHOR_NAME})\s*,\s*({YEAR})(?:,?\s*{PAGE})?\)',
+            re.UNICODE
+        ),
+        
+        # [PATTERN 13] (see Author et al., Year) - prefixed et al. parenthetical
+        re.compile(
+            rf'\({CITATION_PREFIX}({AUTHOR_NAME})\s+{ET_AL},?\s*({YEAR})(?:,?\s*{PAGE})?\)',
+            re.UNICODE
+        ),
+        
+        # [PATTERN 14] Corporate Author (Year) - organizational author narrative
+        # e.g., "American Psychological Association (2020)"
+        re.compile(
+            rf'({CORPORATE_AUTHOR})\s*\(({YEAR})\)',
+            re.UNICODE
+        ),
+        
+        # [PATTERN 15] (Corporate Author, Year) - organizational author parenthetical
+        # e.g., "(American Psychological Association, 2020)"
+        re.compile(
+            rf'\(({CORPORATE_AUTHOR})\s*,\s*({YEAR})\)',
+            re.UNICODE
+        ),
     ]
+    
+    # ==========================================================================
+    # TRIGGER-BASED PATTERNS (Added 2025-12-11)
+    # For citations following context words like "textbook", "article", etc.
+    # ==========================================================================
+    
+    # Pattern for trigger word followed by author chain and year
+    # e.g., "textbooks we consulted were Bernstein, Clarke-Stewart, & Wickens (2000)"
+    # This is processed separately because it needs lookahead from trigger words
+    TRIGGER_PATTERN = re.compile(
+        rf'\b{TRIGGER_WORDS}\b.*?{AUTHOR_CHAIN}\s*\(({YEAR})\)',
+        re.UNICODE | re.IGNORECASE
+    )
+    
+    # Simpler trigger pattern: trigger word + "by" + author(s) + (year)
+    # e.g., "the book by Smith (2019)", "article by Jones and Williams (2020)"
+    TRIGGER_BY_PATTERN = re.compile(
+        rf'\b{TRIGGER_WORDS}\s+(?:by|from|of)\s+{AUTHOR_CHAIN}\s*\(({YEAR})\)',
+        re.UNICODE | re.IGNORECASE
+    )
     
     # Pattern for multiple citations in one parenthetical: (Smith, 2020; Jones, 2021)
     MULTI_CITATION = re.compile(
@@ -339,7 +421,32 @@ class AuthorDateExtractor:
                 )
                 add_if_new(citation, match.start(), match.end(), use_span=False)
         
-        # Pattern 4: Author (Year) - simple narrative (check LAST)
+        # =======================================================================
+        # CORPORATE AUTHORS (Process BEFORE simple narrative Pattern 4)
+        # Corporate authors are multi-word and must match before single-word
+        # =======================================================================
+        
+        # Pattern 14: Corporate Author (Year) - narrative corporate
+        for match in self.PATTERNS[14].finditer(text):
+            citation = AuthorYearCitation(
+                author=match.group(1).strip(),
+                year=match.group(2),
+                is_et_al=False,
+                raw_text=match.group(0)
+            )
+            add_if_new(citation, match.start(), match.end())
+        
+        # Pattern 15: (Corporate Author, Year) - parenthetical corporate
+        for match in self.PATTERNS[15].finditer(text):
+            citation = AuthorYearCitation(
+                author=match.group(1).strip(),
+                year=match.group(2),
+                is_et_al=False,
+                raw_text=match.group(0)
+            )
+            add_if_new(citation, match.start(), match.end())
+        
+        # Pattern 4: Author (Year) - simple narrative (check LAST of standard patterns)
         for match in self.PATTERNS[4].finditer(text):
             citation = AuthorYearCitation(
                 author=match.group(1),
@@ -348,6 +455,59 @@ class AuthorDateExtractor:
                 raw_text=match.group(0)
             )
             add_if_new(citation, match.start(), match.end())
+        
+        # =======================================================================
+        # NEW EDGE CASE PATTERNS (Added 2025-12-11)
+        # =======================================================================
+        
+        # Pattern 11: (see Author, Year) - prefixed single author
+        for match in self.PATTERNS[11].finditer(text):
+            citation = AuthorYearCitation(
+                author=match.group(1),
+                year=match.group(2),
+                is_et_al=False,
+                raw_text=match.group(0)
+            )
+            add_if_new(citation, match.start(), match.end())
+        
+        # Pattern 12: (see Author & Author, Year) - prefixed two-author
+        for match in self.PATTERNS[12].finditer(text):
+            citation = AuthorYearCitation(
+                author=match.group(1),
+                year=match.group(3),
+                is_et_al=False,
+                second_author=match.group(2),
+                raw_text=match.group(0)
+            )
+            add_if_new(citation, match.start(), match.end())
+        
+        # Pattern 13: (see Author et al., Year) - prefixed et al.
+        for match in self.PATTERNS[13].finditer(text):
+            citation = AuthorYearCitation(
+                author=match.group(1),
+                year=match.group(2),
+                is_et_al=True,
+                raw_text=match.group(0)
+            )
+            add_if_new(citation, match.start(), match.end())
+        
+        # Trigger-based patterns: "textbook by Smith (2019)", etc.
+        for match in self.TRIGGER_BY_PATTERN.finditer(text):
+            author_chain = match.group(1)
+            year = match.group(2)
+            # Parse the author chain to extract first author and detect multi-author
+            parsed = self._parse_author_chain(author_chain, year, match.group(0))
+            if parsed:
+                add_if_new(parsed, match.start(), match.end())
+        
+        # General trigger pattern for complex cases like:
+        # "textbooks we consulted were Bernstein, Clarke-Stewart, & Wickens (2000)"
+        for match in self.TRIGGER_PATTERN.finditer(text):
+            author_chain = match.group(1)
+            year = match.group(2)
+            parsed = self._parse_author_chain(author_chain, year, match.group(0))
+            if parsed:
+                add_if_new(parsed, match.start(), match.end())
         
         self.citations = citations
         return citations
@@ -384,6 +544,82 @@ class AuthorDateExtractor:
             second_author=second_author,
             raw_text=raw
         )
+    
+    def _parse_author_chain(self, author_chain: str, year: str, raw: str) -> Optional[AuthorYearCitation]:
+        """
+        Parse an author chain from trigger-based patterns.
+        
+        Handles formats like:
+        - "Smith"
+        - "Smith and Jones" 
+        - "Smith & Jones"
+        - "Bernstein, Clarke-Stewart, Penner, Roy, and Wickens"
+        - "Bernstein, Clarke-Stewart, Penner, Roy, & Wickens"
+        
+        Args:
+            author_chain: The captured author string (may include multiple authors)
+            year: The publication year
+            raw: Full raw text of the match
+            
+        Returns:
+            AuthorYearCitation with first author and et_al flag set appropriately
+        """
+        if not author_chain:
+            return None
+        
+        author_chain = author_chain.strip()
+        
+        # Check if it contains multiple authors (comma or &/and)
+        has_and = bool(re.search(r'\s*(?:&|and)\s*', author_chain, re.IGNORECASE))
+        has_comma = ',' in author_chain
+        
+        if has_and or has_comma:
+            # Multiple authors - split and extract
+            # Split by comma and &/and
+            parts = re.split(r'\s*(?:,|&|\band\b)\s*', author_chain)
+            # Filter to actual author names (start with capital, more than 1 char)
+            author_names = [p.strip() for p in parts if p.strip() and len(p.strip()) > 1 and p.strip()[0].isupper()]
+            
+            if len(author_names) == 0:
+                return None
+            
+            first_author = author_names[0]
+            
+            if len(author_names) == 2:
+                # Two authors
+                return AuthorYearCitation(
+                    author=first_author,
+                    year=year,
+                    is_et_al=False,
+                    second_author=author_names[1],
+                    raw_text=raw
+                )
+            elif len(author_names) >= 3:
+                # Three or more authors
+                return AuthorYearCitation(
+                    author=first_author,
+                    year=year,
+                    is_et_al=True,
+                    second_author=author_names[1],
+                    third_author=author_names[2] if len(author_names) >= 3 else None,
+                    raw_text=raw
+                )
+            else:
+                # Single author (shouldn't happen with &/comma but handle anyway)
+                return AuthorYearCitation(
+                    author=first_author,
+                    year=year,
+                    is_et_al=False,
+                    raw_text=raw
+                )
+        else:
+            # Single author
+            return AuthorYearCitation(
+                author=author_chain,
+                year=year,
+                is_et_al=False,
+                raw_text=raw
+            )
     
     def _parse_multi_author_segment(self, segment: str, raw: str) -> List[AuthorYearCitation]:
         """
