@@ -711,7 +711,7 @@
                     
                     // Load first reference into editor
                     if (currentReferences.length > 0) {
-                        adLoadEditor(0);
+                        await adLoadEditor(0);
                     }
                     
                 } else {
@@ -804,20 +804,20 @@
         
         // ========== AUTHOR-DATE EDITOR ==========
         
-        function adSelectReference(idx) {
+        async function adSelectReference(idx) {
             // Auto-save current if not accepted and has content
             if (adActiveRefIndex >= 0 && adActiveRefIndex !== idx) {
                 const currentRef = currentReferences[adActiveRefIndex];
                 const textarea = document.getElementById('ad-final-edit-area');
                 if (textarea && textarea.value.trim() && !currentRef.accepted) {
                     // Auto-accept current before moving
-                    adCommitChange(true);  // silent = true
+                    await adCommitChange(true);  // silent = true
                 }
             }
-            adLoadEditor(idx);
+            await adLoadEditor(idx);
         }
         
-        function adLoadEditor(idx) {
+        async function adLoadEditor(idx) {
             adActiveRefIndex = idx;
             const ref = currentReferences[idx];
             
@@ -844,10 +844,16 @@
             if (ref.formatted) {
                 // Already formatted - show it
                 textarea.value = ref.formatted;
+            } else if (ref.options.length > 1) {
+                // Pre-populate with first AI option (formatted)
+                textarea.value = 'Loading...';
+                const firstOption = ref.options[1];  // First AI option (index 0 is "keep original")
+                const formatted = await formatMetadata(firstOption);
+                textarea.value = formatted;
             } else {
-                // Not yet formatted - show empty or placeholder
+                // No options - show empty
                 textarea.value = '';
-                textarea.placeholder = 'Select an option below, or type manually...';
+                textarea.placeholder = 'Type citation manually...';
             }
             
             // Render alternative options
@@ -881,7 +887,7 @@
                 const isSelected = actualIdx === ref.selected_option;
                 const typeBadgeClass = `badge-${opt.citation_type || 'unknown'}`;
                 
-                // Build author string
+                // Build author string - show ALL authors for clarity
                 let authorStr = '';
                 if (opt.authors && opt.authors.length > 0) {
                     if (opt.authors.length === 1) {
@@ -889,7 +895,10 @@
                     } else if (opt.authors.length === 2) {
                         authorStr = opt.authors.join(' & ');
                     } else {
-                        authorStr = opt.authors[0] + ' et al.';
+                        // Show all authors: "Author1, Author2, & Author3"
+                        const lastAuthor = opt.authors[opt.authors.length - 1];
+                        const otherAuthors = opt.authors.slice(0, -1);
+                        authorStr = otherAuthors.join(', ') + ', & ' + lastAuthor;
                     }
                 }
                 
@@ -1014,7 +1023,7 @@
             
             const newIdx = adActiveRefIndex + delta;
             if (newIdx >= 0 && newIdx < currentReferences.length) {
-                adLoadEditor(newIdx);
+                await adLoadEditor(newIdx);
             }
         }
         
