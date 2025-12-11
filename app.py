@@ -1158,6 +1158,273 @@ def process_author_date():
         }), 500
 
 
+@app.route('/api/accept-reference', methods=['POST'])
+def accept_reference():
+    """
+    Accept/save a formatted reference for author-date mode.
+    
+    Called when user clicks Accept & Save OR auto-saves on navigation.
+    Persists the formatted text to server session.
+    
+    Request JSON:
+    {
+        "session_id": "uuid",
+        "reference_id": 1,
+        "formatted": "Simonton, D. K. (1992). The social context..."
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({
+                'success': False,
+                'error': 'Missing request data'
+            }), 400
+        
+        session_id = data.get('session_id')
+        reference_id = data.get('reference_id')
+        formatted = data.get('formatted', '')
+        
+        if not session_id or reference_id is None:
+            return jsonify({
+                'success': False,
+                'error': 'Missing session_id or reference_id'
+            }), 400
+        
+        session_data = sessions.get(session_id)
+        
+        if not session_data:
+            return jsonify({
+                'success': False,
+                'error': 'Session not found or expired'
+            }), 404
+        
+        # Get or create accepted_references dict
+        accepted_refs = session_data.get('accepted_references', {})
+        
+        # Store the formatted reference (keyed by reference_id)
+        accepted_refs[str(reference_id)] = {
+            'formatted': formatted,
+            'accepted_at': time.time()
+        }
+        
+        # Save back to session
+        sessions.set(session_id, 'accepted_references', accepted_refs)
+        
+        print(f"[API] Accepted reference {reference_id} for session {session_id[:8]}")
+        
+        return jsonify({
+            'success': True,
+            'reference_id': reference_id
+        })
+        
+    except Exception as e:
+        print(f"[API] Error in /api/accept-reference: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/finalize-author-date', methods=['POST'])
+def finalize_author_date():
+    """
+    Finalize author-date document by appending References section.
+    
+    Called before download. Builds the document with all accepted references.
+    
+    Request JSON:
+    {
+        "session_id": "uuid",
+        "references": [
+            {"id": 1, "original": "(Smith, 2020)", "formatted": "Smith, J. (2020). Title..."},
+            ...
+        ]
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({
+                'success': False,
+                'error': 'Missing request data'
+            }), 400
+        
+        session_id = data.get('session_id')
+        references = data.get('references', [])
+        
+        if not session_id:
+            return jsonify({
+                'success': False,
+                'error': 'Missing session_id'
+            }), 400
+        
+        session_data = sessions.get(session_id)
+        
+        if not session_data:
+            return jsonify({
+                'success': False,
+                'error': 'Session not found or expired'
+            }), 404
+        
+        original_bytes = session_data.get('original_bytes')
+        
+        if not original_bytes:
+            return jsonify({
+                'success': False,
+                'error': 'Original document not found'
+            }), 404
+        
+        # If no references provided, try to get from accepted_references in session
+        if not references:
+            accepted_refs = session_data.get('accepted_references', {})
+            citations = session_data.get('citations', [])
+            
+            for cite in citations:
+                ref_id = str(cite.get('id', cite.get('note_id')))
+                if ref_id in accepted_refs:
+                    references.append({
+                        'id': ref_id,
+                        'original': cite.get('original', ''),
+                        'formatted': accepted_refs[ref_id].get('formatted', '')
+                    })
+        
+        # Generate document with References section
+        from io import BytesIO
+        import zipfile
+        import tempfile
+        import shutil
+        import xml.etree.ElementTree as ET
+        
+        temp_dir = tempfile.mkdtemp()
+        
+        try:
+            with zipfile.ZipFile(BytesIO(original_bytes), 'r') as zf:
+                zf.extractall(temp_dir)
+            
+            doc_path = os.path.join(temp_dir, 'word', 'document.xml')
+            
+            # Register namespaces
+            namespaces = {
+                'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main',
+                'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+            }
+            for prefix, uri in namespaces.items():
+                ET.register_namespace(prefix, uri)
+            
+            tree = ET.parse(doc_path)
+            root = tree.getroot()
+            body = root.find('.//w:body', namespaces)
+            
+            if body is not None:
+                sect_pr = body.find('w:sectPr', namespaces)
+                
+                # Create References heading
+                heading_para = ET.Element(f"{{{namespaces['w']}}}p")
+                heading_pPr = ET.SubElement(heading_para, f"{{{namespaces['w']}}}pPr")
+                heading_style = ET.SubElement(heading_pPr, f"{{{namespaces['w']}}}pStyle")
+                heading_style.set(f"{{{namespaces['w']}}}val", "Heading1")
+                heading_run = ET.SubElement(heading_para, f"{{{namespaces['w']}}}r")
+                heading_text = ET.SubElement(heading_run, f"{{{namespaces['w']}}}t")
+                heading_text.text = "References"
+                
+                # Add blank line
+                blank_para = ET.Element(f"{{{namespaces['w']}}}p")
+                
+                if sect_pr is not None:
+                    idx = list(body).index(sect_pr)
+                    body.insert(idx, heading_para)
+                    body.insert(idx + 1, blank_para)
+                else:
+                    body.append(heading_para)
+                    body.append(blank_para)
+                
+                # Sort references alphabetically by formatted text
+                sorted_refs = sorted(references, key=lambda r: r.get('formatted', '').lower())
+                
+                # Add each reference
+                for ref in sorted_refs:
+                    formatted = ref.get('formatted', ref.get('original', ''))
+                    if not formatted:
+                        continue
+                    
+                    ref_para = ET.Element(f"{{{namespaces['w']}}}p")
+                    
+                    # Hanging indent style
+                    ref_pPr = ET.SubElement(ref_para, f"{{{namespaces['w']}}}pPr")
+                    ref_ind = ET.SubElement(ref_pPr, f"{{{namespaces['w']}}}ind")
+                    ref_ind.set(f"{{{namespaces['w']}}}left", "720")
+                    ref_ind.set(f"{{{namespaces['w']}}}hanging", "720")
+                    
+                    # Parse for italics
+                    import re
+                    import html
+                    parts = re.split(r'(<i>.*?</i>)', html.unescape(formatted))
+                    
+                    for part in parts:
+                        if not part:
+                            continue
+                        
+                        run = ET.SubElement(ref_para, f"{{{namespaces['w']}}}r")
+                        
+                        italic_match = re.match(r'<i>(.*?)</i>', part)
+                        if italic_match:
+                            rPr = ET.SubElement(run, f"{{{namespaces['w']}}}rPr")
+                            ET.SubElement(rPr, f"{{{namespaces['w']}}}i")
+                            text_content = italic_match.group(1)
+                        else:
+                            text_content = part
+                        
+                        t = ET.SubElement(run, f"{{{namespaces['w']}}}t")
+                        t.text = text_content
+                        t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+                    
+                    if sect_pr is not None:
+                        idx = list(body).index(sect_pr)
+                        body.insert(idx, ref_para)
+                    else:
+                        body.append(ref_para)
+            
+            # Write modified document
+            tree.write(doc_path, encoding='UTF-8', xml_declaration=True)
+            
+            # Repackage docx
+            output_buffer = BytesIO()
+            with zipfile.ZipFile(output_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for root_dir, dirs, files in os.walk(temp_dir):
+                    for file in files:
+                        file_path = os.path.join(root_dir, file)
+                        arcname = os.path.relpath(file_path, temp_dir)
+                        zf.write(file_path, arcname)
+            
+            output_buffer.seek(0)
+            processed_bytes = output_buffer.read()
+            
+            # Save to session for download
+            sessions.set(session_id, 'processed_doc', processed_bytes)
+            
+            print(f"[API] Finalized author-date document with {len(references)} references")
+            
+            return jsonify({
+                'success': True,
+                'reference_count': len(references)
+            })
+            
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        
+    except Exception as e:
+        print(f"[API] Error in /api/finalize-author-date: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
 @app.route('/api/select-citation', methods=['POST'])
 def select_citation():
     """
@@ -1236,89 +1503,6 @@ def select_citation():
         
     except Exception as e:
         print(f"[API] Error in /api/select-citation: {e}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-
-@app.route('/api/finalize-author-date', methods=['POST'])
-def finalize_author_date():
-    """
-    Finalize the author-date document with all selected citations.
-    
-    Request JSON:
-    {
-        "session_id": "uuid"
-    }
-    
-    Returns the processed document ready for download.
-    """
-    try:
-        data = request.get_json()
-        
-        if not data:
-            return jsonify({
-                'success': False,
-                'error': 'Missing request data'
-            }), 400
-        
-        session_id = data.get('session_id')
-        
-        if not session_id:
-            return jsonify({
-                'success': False,
-                'error': 'Missing session_id'
-            }), 400
-        
-        session_data = sessions.get(session_id)
-        if not session_data:
-            return jsonify({
-                'success': False,
-                'error': 'Session not found or expired'
-            }), 404
-        
-        original_bytes = session_data.get('original_bytes')
-        citations = session_data.get('citations', [])
-        
-        if not original_bytes:
-            return jsonify({
-                'success': False,
-                'error': 'Original document not found'
-            }), 404
-        
-        # Process the document with selected citations
-        from document_processor import WordDocumentProcessor
-        from io import BytesIO
-        
-        processor = WordDocumentProcessor(BytesIO(original_bytes))
-        
-        # Update each note with its selected citation
-        for citation in citations:
-            note_id = citation.get('note_id')
-            formatted = citation.get('formatted') or citation.get('original')
-            
-            if note_id and formatted:
-                # Try endnote first, then footnote
-                if not processor.write_endnote(note_id, formatted):
-                    processor.write_footnote(note_id, formatted)
-        
-        # Save to buffer
-        doc_buffer = processor.save_to_buffer()
-        processor.cleanup()
-        
-        # Store processed document
-        processed_bytes = doc_buffer.read()
-        sessions.set(session_id, 'processed_doc', processed_bytes)
-        
-        return jsonify({
-            'success': True,
-            'session_id': session_id,
-            'message': 'Document finalized successfully'
-        })
-        
-    except Exception as e:
-        print(f"[API] Error in /api/finalize-author-date: {e}")
         return jsonify({
             'success': False,
             'error': str(e)
