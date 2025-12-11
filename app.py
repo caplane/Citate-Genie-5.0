@@ -1000,11 +1000,11 @@ def process_author_date():
         return jsonify({
             'success': True,
             'session_id': session_id,
-            'citations': citations,
+            'references': citations,  # Frontend expects 'references' not 'citations'
             'stats': {
                 'total': len(citations),
-                'with_options': sum(1 for c in citations if c.get('options')),
-                'no_options': sum(1 for c in citations if not c.get('options'))
+                'resolved': sum(1 for c in citations if c.get('options')),  # Frontend expects 'resolved'
+                'failed': sum(1 for c in citations if not c.get('options'))  # Frontend expects 'failed'
             }
         })
         
