@@ -4,20 +4,6 @@ citeflex/unified_router.py
 Unified routing logic combining the best of CiteFlex Pro and Cite Fix Pro.
 
 Version History:
-    2025-12-10 V3.8: Added get_parenthetical_options() for multi-choice UI.
-                     Returns up to 5 possible works for user selection.
-    2025-12-10 V3.7: Added AI lookup for parenthetical citations (Author, Year).
-                     Uses OpenAI (gpt-4o) first, Claude fallback.
-                     Catches APA-style refs like (Simonton, 1992) and identifies
-                     the actual work via AI knowledge before database search.
-    2025-12-06 16:00 V3.6: Added legal citation parser to recognize already-formatted
-                           legal citations. Patterns: "Case v. Case, 388 U.S. 1 (1967)"
-                           and UK neutral citations "[2024] UKSC 1". Properly formatted
-                           legal citations now bypass legal.py database search.
-    2025-12-06 15:30 V3.5: Added interview and letter citation parsers.
-                           Interview triggers: "interview by", "interview with", "oral history"
-                           Letter trigger: "Person X to Person Y, Date" pattern
-                           Both types now bypass database search when parsed successfully.
     2025-12-06 13:45 V3.4: Added citation parser to extract metadata from already-formatted
                            citations. Reformats without database search when citation is complete.
                            Preserves authoritative content while applying consistent style.
@@ -40,16 +26,16 @@ Version History:
     2025-12-06 V3.0: Switched to Claude API as primary AI router
 
 KEY IMPROVEMENTS OVER ORIGINAL router.py:
-1. Legal detection uses legal.is_legal_citation() which checks FAMOUS_CASES cache
+1. Legal detection uses superlegal.is_legal_citation() which checks FAMOUS_CASES cache
    during detection (not just regex patterns that miss bare case names)
-2. Legal extraction uses legal.extract_metadata() for cache + CourtListener API
+2. Legal extraction uses superlegal.extract_metadata() for cache + CourtListener API
 3. Book search uses books.py's GoogleBooksAPI + OpenLibraryAPI with PUBLISHER_PLACE_MAP
 4. Academic search uses CiteFlex Pro's parallel engine execution
 5. Medical URL override prevents PubMed/NIH URLs from routing to government
 6. Claude AI router for ambiguous queries with multi-option support
 
 ARCHITECTURE:
-- Wrapper classes convert legal.py/books.py dicts → CitationMetadata
+- Wrapper classes convert superlegal.py/books.py dicts → CitationMetadata
 - Parallel execution via ThreadPoolExecutor (12s timeout)
 - Routing priority: Legal → URL handling → Parallel search → Fallback
 """
@@ -60,31 +46,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as
 
 from models import CitationMetadata, CitationType
 from config import NEWSPAPER_DOMAINS, GOV_AGENCY_MAP
-from utils.type_detection import detect_type, DetectionResult, is_url
-from utils.metadata_extraction import extract_by_type
+from detectors import detect_type, DetectionResult, is_url
+from extractors import extract_by_type
 from formatters.base import get_formatter
 
 # Import CiteFlex Pro engines
 from engines.academic import CrossrefEngine, OpenAlexEngine, SemanticScholarEngine, PubMedEngine
 from engines.doi import extract_doi_from_url, is_academic_publisher_url
-from engines.google_scholar import GoogleScholarEngine
-from engines.arxiv import ArxivEngine
-from engines.video import YouTubeEngine, VimeoEngine
 
 # Import Cite Fix Pro modules (now in engines/)
-from engines import legal
+from engines import superlegal
 from engines import books
 from engines.famous_papers import find_famous_paper
-
-# Import Claude-first guess function
-from routers.claude import guess_and_search
-
-# Import AI lookup for parenthetical citations (Author, Year)
-from engines.ai_lookup import (
-    is_parenthetical_citation, 
-    lookup_parenthetical_citation,
-    lookup_parenthetical_citation_options
-)
 
 # =============================================================================
 # AI ROUTER CONFIGURATION (Claude primary, Gemini fallback)
@@ -95,7 +68,7 @@ AI_ROUTER = os.environ.get('AI_ROUTER', 'claude').lower()  # 'claude' or 'gemini
 
 # Try to import Claude router (primary)
 try:
-    from routers.claude import classify_with_claude, get_citation_options
+    from claude_router import classify_with_claude, get_citation_options
     CLAUDE_AVAILABLE = True
 except ImportError:
     CLAUDE_AVAILABLE = False
@@ -103,7 +76,7 @@ except ImportError:
 
 # Try to import Gemini router (fallback)
 try:
-    from routers.gemini import classify_with_gemini
+    from gemini_router import classify_with_gemini
     GEMINI_AVAILABLE = True
 except ImportError:
     GEMINI_AVAILABLE = False
@@ -139,7 +112,7 @@ else:
 # =============================================================================
 
 PARALLEL_TIMEOUT = 12  # seconds
-MAX_WORKERS = 6
+MAX_WORKERS = 4
 
 # Medical domains that should NOT route to government engine
 MEDICAL_DOMAINS = ['pubmed', 'ncbi.nlm.nih.gov', 'nih.gov/health', 'medlineplus']
@@ -153,10 +126,6 @@ _crossref = CrossrefEngine()
 _openalex = OpenAlexEngine()
 _semantic = SemanticScholarEngine()
 _pubmed = PubMedEngine()
-_google_scholar = GoogleScholarEngine()
-_arxiv = ArxivEngine()
-_youtube = YouTubeEngine()
-_vimeo = VimeoEngine()
 
 
 # =============================================================================
@@ -164,7 +133,7 @@ _vimeo = VimeoEngine()
 # =============================================================================
 
 def _legal_dict_to_metadata(data: dict, raw_source: str) -> Optional[CitationMetadata]:
-    """Convert legal.py extract_metadata() dict to CitationMetadata."""
+    """Convert superlegal.py extract_metadata() dict to CitationMetadata."""
     if not data:
         return None
     
@@ -224,37 +193,19 @@ def parse_existing_citation(query: str) -> Optional[CitationMetadata]:
     preserving the user's authoritative content while applying style rules.
     
     Supports:
-    - Legal: Case Name, Volume Reporter Page (Court Year).
     - Chicago journal: Author, "Title," Journal Vol, no. Issue (Year): Pages. DOI
     - Chicago book: Author, Title (Place: Publisher, Year).
-    - Interview: Name, interview by author, Date.
-    - Letter: Person X to Person Y, Date.
     - APA patterns
     - Citations with DOIs/URLs
     
     Returns CitationMetadata if parsing succeeds, None otherwise.
     """
-    if not query or len(query) < 15:
+    if not query or len(query) < 20:
         return None
     
     query = query.strip()
     
-    # Try legal citation first (has distinctive patterns)
-    meta = _parse_legal_citation(query)
-    if meta and (meta.case_name and meta.year):
-        return meta
-    
-    # Try interview pattern (has distinctive triggers)
-    meta = _parse_interview_citation(query)
-    if meta and _is_citation_complete(meta):
-        return meta
-    
-    # Try letter pattern (Person X to Person Y, Date)
-    meta = _parse_letter_citation(query)
-    if meta and _is_citation_complete(meta):
-        return meta
-    
-    # Try journal pattern (most common in academic work)
+    # Try journal pattern first (most common in academic work)
     meta = _parse_journal_citation(query)
     if meta and _is_citation_complete(meta):
         return meta
@@ -270,363 +221,6 @@ def parse_existing_citation(query: str) -> Optional[CitationMetadata]:
         return meta
     
     return None
-
-
-def _parse_legal_citation(query: str) -> Optional[CitationMetadata]:
-    """
-    Parse already-formatted legal citation.
-    
-    Patterns recognized:
-    - US: Case Name, Volume Reporter Page (Court Year).
-      e.g., Loving v. Virginia, 388 U.S. 1 (1967).
-    - US Circuit: Case Name, Volume F.2d/F.3d Page (Circuit Year).
-      e.g., Johnson v. Branch, 364 F.2d 177 (4th Cir. 1966).
-    - US District: Case Name, Volume F. Supp. Page (District Year).
-      e.g., Landman v. Royster, 333 F. Supp. 621 (E.D. Va. 1971).
-    - UK: Case Name [Year] Court Number
-      e.g., R v Brown [1994] 1 AC 212
-    
-    Returns CitationMetadata if parsing succeeds, None otherwise.
-    """
-    if not query or len(query) < 10:
-        return None
-    
-    query = query.strip()
-    
-    # Must have "v." or "v " pattern (case name indicator)
-    if not re.search(r'\s+v\.?\s+', query, re.IGNORECASE):
-        # Also check for "In re" or "Ex parte" patterns
-        if not re.search(r'^(In\s+re|Ex\s+parte|Matter\s+of)\s+', query, re.IGNORECASE):
-            return None
-    
-    case_name = ''
-    citation = ''
-    court = ''
-    year = ''
-    
-    # =========================================================================
-    # Pattern 1: US Citations - Case Name, Citation (Court Year).
-    # =========================================================================
-    
-    # Match: Case Name, Volume Reporter Page (Court? Year)
-    # Examples:
-    #   Loving v. Virginia, 388 U.S. 1 (1967)
-    #   Johnson v. Branch, 364 F.2d 177 (4th Cir. 1966)
-    #   Landman v. Royster, 333 F. Supp. 621 (E.D. Va. 1971)
-    
-    us_pattern = re.compile(
-        r'^(.+?)\s*,\s*'                    # Case name (up to comma)
-        r'(\d+\s+'                           # Volume number
-        r'(?:U\.S\.|S\.\s*Ct\.|L\.\s*Ed\.|'  # Supreme Court reporters
-        r'F\.(?:\d[a-z]*d?\s*)?|'            # Federal Reporter (F., F.2d, F.3d, F. 4th)
-        r'F\.\s*Supp\.(?:\s*\d+[a-z]*)?|'   # F. Supp., F. Supp. 2d, F. Supp. 3d
-        r'[A-Z]\.\d*[a-z]*)'                 # State reporters (A.2d, N.E.2d, etc.)
-        r'\s*\d+)'                           # Page number
-        r'\s*\(([^)]+)\)'                    # Parenthetical (Court Year)
-    )
-    
-    match = us_pattern.match(query)
-    if match:
-        case_name = match.group(1).strip()
-        citation = match.group(2).strip()
-        paren_content = match.group(3).strip()
-        
-        # Parse parenthetical: could be just year "(1967)" or court + year "(4th Cir. 1966)"
-        year_match = re.search(r'(\d{4})', paren_content)
-        if year_match:
-            year = year_match.group(1)
-            court_part = paren_content[:year_match.start()].strip().rstrip(',')
-            if court_part:
-                court = court_part
-            else:
-                # Infer court from reporter
-                if 'U.S.' in citation:
-                    court = 'Supreme Court of the United States'
-                elif 'S. Ct.' in citation:
-                    court = 'Supreme Court of the United States'
-        
-        return CitationMetadata(
-            citation_type=CitationType.LEGAL,
-            raw_source=query,
-            source_engine="Parsed from formatted citation",
-            case_name=case_name,
-            citation=citation,
-            court=court,
-            year=year,
-            jurisdiction='US'
-        )
-    
-    # =========================================================================
-    # Pattern 2: UK Neutral Citations - Case Name [Year] Court Number
-    # =========================================================================
-    
-    uk_pattern = re.compile(
-        r'^(.+?)\s*'                         # Case name
-        r'\[(\d{4})\]\s*'                    # [Year]
-        r'(\w+(?:\s+\w+)?)\s*'               # Court code (UKSC, EWCA Civ, etc.)
-        r'(\d+)'                              # Case number
-    )
-    
-    match = uk_pattern.match(query)
-    if match:
-        case_name = match.group(1).strip().rstrip(',')
-        year = match.group(2)
-        court_code = match.group(3).strip()
-        case_number = match.group(4)
-        citation = f'[{year}] {court_code} {case_number}'
-        
-        # Map court codes
-        uk_courts = {
-            'UKSC': 'Supreme Court',
-            'UKHL': 'House of Lords',
-            'EWCA Civ': 'Court of Appeal (Civil)',
-            'EWCA Crim': 'Court of Appeal (Criminal)',
-            'EWHC': 'High Court',
-        }
-        court = uk_courts.get(court_code, court_code)
-        
-        return CitationMetadata(
-            citation_type=CitationType.LEGAL,
-            raw_source=query,
-            source_engine="Parsed from formatted citation",
-            case_name=case_name,
-            citation=citation,
-            court=court,
-            year=year,
-            jurisdiction='UK'
-        )
-    
-    # =========================================================================
-    # Pattern 3: Simpler fallback - just extract what we can
-    # =========================================================================
-    
-    # Try to extract case name before comma
-    parts = query.split(',', 1)
-    if len(parts) >= 1:
-        potential_name = parts[0].strip()
-        if re.search(r'\s+v\.?\s+', potential_name, re.IGNORECASE) or \
-           re.search(r'^(In\s+re|Ex\s+parte)', potential_name, re.IGNORECASE):
-            case_name = potential_name
-            
-            # Try to find year in rest
-            if len(parts) > 1:
-                rest = parts[1]
-                year_match = re.search(r'\((\d{4})\)', rest)
-                if year_match:
-                    year = year_match.group(1)
-                
-                # Try to extract citation (numbers + reporter)
-                cit_match = re.search(r'(\d+\s+[A-Z][A-Za-z\.\s]+\d+)', rest)
-                if cit_match:
-                    citation = cit_match.group(1).strip()
-            
-            if case_name and year:
-                return CitationMetadata(
-                    citation_type=CitationType.LEGAL,
-                    raw_source=query,
-                    source_engine="Parsed from formatted citation",
-                    case_name=case_name,
-                    citation=citation,
-                    court=court,
-                    year=year,
-                    jurisdiction='US'
-                )
-    
-    return None
-
-
-def _parse_interview_citation(query: str) -> Optional[CitationMetadata]:
-    """
-    Parse interview citation.
-    
-    Triggers (high confidence):
-    - "interview by" 
-    - "interview with"
-    - "oral history"
-    - "interviewed by"
-    
-    Patterns:
-    - Name, interview by author, Date, Location.
-    - Name, interview with Author, Date.
-    - Name interview by Author, Date. Digitally recorded in author's possession.
-    """
-    query_lower = query.lower()
-    
-    # Check for interview triggers
-    triggers = ['interview by', 'interview with', 'oral history', 'interviewed by']
-    has_trigger = any(t in query_lower for t in triggers)
-    
-    if not has_trigger:
-        return None
-    
-    interviewee = ''
-    interviewer = ''
-    date = ''
-    location = ''
-    url = ''
-    
-    # Extract URL if present
-    url_match = re.search(r'https?://[^\s,]+', query)
-    if url_match:
-        url = url_match.group(0).rstrip('.,;')
-    
-    # Pattern: Interviewee, interview by Interviewer, Date
-    # Or: Interviewee interview by Interviewer, Date
-    interview_match = re.search(
-        r'^([^,]+?)(?:,\s*)?\binterview(?:ed)?\s+(?:by|with)\s+([^,]+)',
-        query, re.IGNORECASE
-    )
-    
-    if interview_match:
-        interviewee = interview_match.group(1).strip()
-        interviewer = interview_match.group(2).strip()
-        
-        # Get rest of string for date/location
-        rest = query[interview_match.end():].strip().lstrip(',').strip()
-        
-        # Extract date (various formats)
-        date_patterns = [
-            r'([A-Z][a-z]+\.?\s+\d{1,2},?\s+\d{4})',  # Jan. 15, 2022
-            r'(\d{1,2}\s+[A-Z][a-z]+\.?\s+\d{4})',     # 15 Jan 2022
-            r'([A-Z][a-z]+\s+\d{4})',                   # January 2022
-            r'(\d{4})',                                  # Just year
-        ]
-        
-        for pattern in date_patterns:
-            date_match = re.search(pattern, rest)
-            if date_match:
-                date = date_match.group(1)
-                break
-        
-        # Location might be city name before or after date
-        # Often: "Potomac, MD" or just location info
-        loc_match = re.search(r',\s*([A-Z][a-z]+(?:,\s*[A-Z]{2})?)\s*,', rest)
-        if loc_match:
-            location = loc_match.group(1)
-    
-    # Handle oral history pattern
-    elif 'oral history' in query_lower:
-        # Pattern: Name Oral History Interview, Source
-        oral_match = re.search(r'^([^,]+?)\s+oral\s+history', query, re.IGNORECASE)
-        if oral_match:
-            interviewee = oral_match.group(1).strip()
-    
-    if not interviewee:
-        return None
-    
-    # Extract year from date
-    year = ''
-    if date:
-        year_match = re.search(r'(\d{4})', date)
-        if year_match:
-            year = year_match.group(1)
-    
-    return CitationMetadata(
-        citation_type=CitationType.INTERVIEW,
-        raw_source=query,
-        source_engine="Parsed from formatted citation",
-        interviewee=interviewee,
-        interviewer=interviewer,
-        date=date,
-        year=year,
-        location=location,
-        url=url
-    )
-
-
-def _parse_letter_citation(query: str) -> Optional[CitationMetadata]:
-    """
-    Parse letter/correspondence citation.
-    
-    Trigger: "Person X to Person Y, Date" pattern
-    The date requirement prevents false positives like "Introduction to Psychology"
-    
-    Patterns:
-    - John Grad to Philip J. Hirschkop, Apr. 19, 1977.
-    - Aaron Fodiman to Henry Kissinger, Mar. 11, 1976.
-    - Name to Name, "Subject," Date, Collection.
-    """
-    # Pattern: Name to Name, followed by a date
-    # Must have date within reasonable distance to avoid "Introduction to X"
-    
-    # Look for "Name to Name" followed by comma and date-like content
-    # Names typically: First Last or First M. Last or First Middle Last
-    letter_pattern = re.compile(
-        r'^([A-Z][a-z]+(?:\s+[A-Z]\.?)?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)'  # Sender
-        r'\s+to\s+'
-        r'([A-Z][a-z]+(?:\s+[A-Z]\.?)?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)'  # Recipient
-        r',\s*'
-        r'(.+)$',  # Rest (should contain date)
-        re.MULTILINE
-    )
-    
-    match = letter_pattern.match(query)
-    if not match:
-        return None
-    
-    sender = match.group(1).strip()
-    recipient = match.group(2).strip()
-    rest = match.group(3).strip()
-    
-    # Must have a date within the rest to confirm this is a letter
-    date_patterns = [
-        r'([A-Z][a-z]{2,8}\.?\s+\d{1,2},?\s+\d{4})',  # Apr. 19, 1977 or April 19, 1977
-        r'(\d{1,2}\s+[A-Z][a-z]{2,8}\.?\s+\d{4})',     # 19 Apr 1977
-        r'([A-Z][a-z]{2,8}\.?\s+\d{4})',               # April 1977
-    ]
-    
-    date = ''
-    year = ''
-    for pattern in date_patterns:
-        date_match = re.search(pattern, rest)
-        if date_match:
-            date = date_match.group(1)
-            year_match = re.search(r'(\d{4})', date)
-            if year_match:
-                year = year_match.group(1)
-            break
-    
-    # If no date found, this might not be a letter (could be "Introduction to Psychology")
-    if not date:
-        return None
-    
-    # Extract URL if present
-    url = ''
-    url_match = re.search(r'https?://[^\s,]+', rest)
-    if url_match:
-        url = url_match.group(0).rstrip('.,;')
-    
-    # Extract subject/title if in quotes
-    title = ''
-    title_match = re.search(r'"([^"]+)"', rest)
-    if title_match:
-        title = title_match.group(1)
-    
-    # Extract location/collection info (often after date)
-    location = ''
-    # Look for collection info after date
-    if date:
-        after_date_idx = rest.find(date) + len(date)
-        after_date = rest[after_date_idx:].strip().lstrip(',').strip()
-        # Remove URL from consideration
-        if url:
-            after_date = after_date.replace(url, '').strip()
-        after_date = after_date.rstrip('.')
-        if after_date and not after_date.startswith('http'):
-            location = after_date
-    
-    return CitationMetadata(
-        citation_type=CitationType.LETTER,
-        raw_source=query,
-        source_engine="Parsed from formatted citation",
-        sender=sender,
-        recipient=recipient,
-        title=title,  # Subject line if present
-        date=date,
-        year=year,
-        location=location,  # Collection/archive info
-        url=url
-    )
 
 
 def _parse_journal_citation(query: str) -> Optional[CitationMetadata]:
@@ -981,22 +575,11 @@ def _is_citation_complete(meta: CitationMetadata) -> bool:
     - Journal: title + (journal OR year)
     - Book: title + (publisher OR year)  
     - Newspaper: title + (newspaper OR date OR url)
-    - Interview: interviewee + (date OR interviewer)
-    - Letter: sender + recipient + date
     - Legal: handled separately (not parsed here)
     """
     if not meta:
         return False
     
-    if meta.citation_type == CitationType.INTERVIEW:
-        # Need interviewee plus date or interviewer
-        return bool(meta.interviewee and (meta.date or meta.interviewer))
-    
-    elif meta.citation_type == CitationType.LETTER:
-        # Need sender, recipient, and date
-        return bool(meta.sender and meta.recipient and meta.date)
-    
-    # For other types, title is required
     if not meta.title:
         return False
     
@@ -1016,12 +599,12 @@ def _is_citation_complete(meta: CitationMetadata) -> bool:
 
 
 # =============================================================================
-# UNIFIED LEGAL SEARCH (uses legal.py)
+# UNIFIED LEGAL SEARCH (uses superlegal.py)
 # =============================================================================
 
 def _route_legal(query: str) -> Optional[CitationMetadata]:
     """
-    Route legal case queries using Cite Fix Pro's legal.py.
+    Route legal case queries using Cite Fix Pro's superlegal.py.
     
     This is superior to CiteFlex Pro's legal.py because:
     1. FAMOUS_CASES cache has 100+ landmark cases
@@ -1030,7 +613,7 @@ def _route_legal(query: str) -> Optional[CitationMetadata]:
     4. CourtListener API fallback with phrase/keyword/fuzzy attempts
     """
     try:
-        data = legal.extract_metadata(query)
+        data = superlegal.extract_metadata(query)
         if data and (data.get('case_name') or data.get('citation')):
             return _legal_dict_to_metadata(data, query)
     except Exception as e:
@@ -1043,70 +626,6 @@ def _route_legal(query: str) -> Optional[CitationMetadata]:
 # UNIFIED BOOK SEARCH (uses books.py)
 # =============================================================================
 
-def _validate_book_match(query: str, book_dict: dict) -> bool:
-    """
-    Validate that a book result actually matches the search query.
-    
-    Prevents returning wrong books like "Tackle Football..." for "Caplan trains brains".
-    
-    Requirements:
-    1. At least 2 meaningful words from query must appear in title+authors
-    2. If query has a 4-digit year, it should match (with 1 year tolerance)
-    
-    FIX for Bug #2: Added 2025-12-09
-    """
-    if not book_dict:
-        return False
-    
-    query_lower = query.lower()
-    
-    # Build searchable text from book result
-    title = book_dict.get('title', '')
-    authors = book_dict.get('authors', [])
-    searchable = title.lower()
-    if authors:
-        searchable += ' ' + ' '.join(authors).lower()
-    
-    # Common words to ignore
-    stop_words = {'the', 'a', 'an', 'of', 'and', 'in', 'on', 'at', 'to', 'for', 'by', 'with'}
-    
-    # Extract meaningful words from query (3+ chars, not stop words, not year)
-    query_words = [w for w in query_lower.split() 
-                   if len(w) >= 3 and w not in stop_words and not w.isdigit()]
-    
-    if not query_words:
-        return True  # Nothing to match against
-    
-    # Count how many query words appear in searchable text
-    matches = sum(1 for word in query_words if word in searchable)
-    
-    # Require at least 2 matches, OR all matches if only 1-2 words
-    min_required = min(2, len(query_words))
-    word_match = matches >= min_required
-    
-    # Check year if query contains one
-    year_match = True  # Default to true if no year in query
-    year_in_query = re.search(r'\b(19|20)\d{2}\b', query)
-    book_year = book_dict.get('year', '')
-    if year_in_query and book_year:
-        query_year = int(year_in_query.group())
-        try:
-            result_year = int(str(book_year)[:4])
-            # Allow 1 year tolerance for publication date variations
-            year_match = abs(query_year - result_year) <= 1
-        except (ValueError, TypeError):
-            year_match = True  # Can't compare, allow it
-    
-    if word_match and year_match:
-        print(f"[BookMatch] ✓ Matched {matches}/{len(query_words)} words: {query_words}")
-    else:
-        print(f"[BookMatch] ✗ Only {matches}/{len(query_words)} words matched in '{title[:50]}...'")
-        print(f"[BookMatch]   Query words: {query_words}")
-        print(f"[BookMatch]   Searchable: {searchable[:80]}...")
-    
-    return word_match and year_match
-
-
 def _route_book(query: str) -> Optional[CitationMetadata]:
     """
     Route book queries using Cite Fix Pro's books.py.
@@ -1115,20 +634,11 @@ def _route_book(query: str) -> Optional[CitationMetadata]:
     1. Dual-engine: Open Library (precise ISBN) + Google Books (fuzzy search)
     2. PUBLISHER_PLACE_MAP fills in publication places
     3. ISBN detection routes to Open Library first
-    
-    UPDATED 2025-12-09: Added validation to prevent wrong book matches.
     """
     try:
         results = books.extract_metadata(query)
         if results and len(results) > 0:
-            # Validate each result until we find one that matches
-            for result in results:
-                if _validate_book_match(query, result):
-                    return _book_dict_to_metadata(result, query)
-            
-            # If no result matches, log warning and return None
-            print(f"[UnifiedRouter] No book results matched query: {query[:50]}...")
-            return None
+            return _book_dict_to_metadata(results[0], query)
     except Exception as e:
         print(f"[UnifiedRouter] Book search error: {e}")
     
@@ -1138,112 +648,6 @@ def _route_book(query: str) -> Optional[CitationMetadata]:
 # =============================================================================
 # UNIFIED JOURNAL SEARCH (parallel execution)
 # =============================================================================
-
-def _titles_loosely_match(title1: str, title2: str) -> bool:
-    """
-    Check if two titles are similar enough to be the same work.
-    Used to verify Crossref DOI matches Google Scholar result.
-    
-    Returns True if:
-    - Titles are identical (case-insensitive)
-    - One title contains the other (handles subtitles)
-    - Word overlap is >= 60%
-    """
-    if not title1 or not title2:
-        return False
-    
-    t1 = title1.lower().strip()
-    t2 = title2.lower().strip()
-    
-    # Exact match
-    if t1 == t2:
-        return True
-    
-    # One contains the other (handles subtitles)
-    if t1 in t2 or t2 in t1:
-        return True
-    
-    # Word overlap ratio
-    # Remove common punctuation
-    import re
-    t1_clean = re.sub(r'[^\w\s]', '', t1)
-    t2_clean = re.sub(r'[^\w\s]', '', t2)
-    
-    words1 = set(t1_clean.split())
-    words2 = set(t2_clean.split())
-    
-    # Remove very short words
-    words1 = {w for w in words1 if len(w) > 2}
-    words2 = {w for w in words2 if len(w) > 2}
-    
-    if not words1 or not words2:
-        return False
-    
-    overlap = len(words1 & words2)
-    smaller = min(len(words1), len(words2))
-    
-    return (overlap / smaller) >= 0.6
-
-
-def _validate_journal_match(query: str, result: CitationMetadata) -> bool:
-    """
-    Validate that a journal/academic result matches the search query.
-    
-    Similar to book validation - prevents returning wrong articles like
-    "Jieli Chen et al." for "Caplan trains brains".
-    
-    Requirements:
-    1. At least 2 meaningful words from query must appear in title+authors
-    2. If query has a 4-digit year, it should match (with 1 year tolerance)
-    
-    FIX for Bug: Added 2025-12-09
-    """
-    if not result or not result.title:
-        return False
-    
-    query_lower = query.lower()
-    
-    # Build searchable text from result
-    searchable = result.title.lower()
-    if result.authors:
-        searchable += ' ' + ' '.join(result.authors).lower()
-    
-    # Common words to ignore
-    stop_words = {'the', 'a', 'an', 'of', 'and', 'in', 'on', 'at', 'to', 'for', 'by', 'with'}
-    
-    # Extract meaningful words from query (3+ chars, not stop words, not year)
-    query_words = [w for w in query_lower.split() 
-                   if len(w) >= 3 and w not in stop_words and not w.isdigit()]
-    
-    if not query_words:
-        return True  # Nothing to match against
-    
-    # Count how many query words appear in searchable text
-    matches = sum(1 for word in query_words if word in searchable)
-    
-    # Require at least 2 matches, OR all matches if only 1-2 words
-    min_required = min(2, len(query_words))
-    word_match = matches >= min_required
-    
-    # Check year if query contains one
-    year_match = True  # Default to true if no year in query
-    year_in_query = re.search(r'\b(19|20)\d{2}\b', query)
-    if year_in_query and result.year:
-        query_year = int(year_in_query.group())
-        try:
-            result_year = int(str(result.year)[:4])
-            # Allow 1 year tolerance for publication date variations
-            year_match = abs(query_year - result_year) <= 1
-        except (ValueError, TypeError):
-            year_match = True  # Can't compare, allow it
-    
-    if word_match and year_match:
-        print(f"[JournalMatch] ✓ Matched {matches}/{len(query_words)} words: {query_words}")
-    else:
-        print(f"[JournalMatch] ✗ Only {matches}/{len(query_words)} words matched in '{result.title[:50]}...'")
-    
-    return word_match and year_match
-
 
 def _route_journal(query: str) -> Optional[CitationMetadata]:
     """
@@ -1278,17 +682,7 @@ def _route_journal(query: str) -> Optional[CitationMetadata]:
         except Exception:
             pass
     
-    # Claude-first guess: Use Claude's knowledge to predict citation, then verify via APIs
-    # This is especially effective for fragmentary queries like "Eric Caplan trains brains"
-    try:
-        claude_result = guess_and_search(query)
-        if claude_result and claude_result.has_minimum_data():
-            print(f"[UnifiedRouter] Found via Claude-first guess: {claude_result.source_engine}")
-            return claude_result
-    except Exception as e:
-        print(f"[UnifiedRouter] Claude-first guess failed: {e}")
-    
-    # Parallel search across academic engines (fallback)
+    # Parallel search across academic engines
     results = []
     
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -1297,8 +691,6 @@ def _route_journal(query: str) -> Optional[CitationMetadata]:
             executor.submit(_openalex.search, query): "OpenAlex",
             executor.submit(_semantic.search, query): "Semantic Scholar",
             executor.submit(_pubmed.search, query): "PubMed",
-            executor.submit(_google_scholar.search, query): "Google Scholar",
-            executor.submit(_arxiv.search, query): "arXiv",
         }
         
         for future in as_completed(futures, timeout=PARALLEL_TIMEOUT):
@@ -1306,34 +698,10 @@ def _route_journal(query: str) -> Optional[CitationMetadata]:
             try:
                 result = future.result(timeout=2)
                 if result and result.has_minimum_data():
-                    # FIX 2025-12-09: Validate result matches query before accepting
-                    if _validate_journal_match(query, result):
-                        result.source_engine = engine_name
-                        results.append(result)
+                    result.source_engine = engine_name
+                    results.append(result)
             except Exception:
                 pass
-    
-    # Enrich Google Scholar results with DOI from Crossref
-    for result in results:
-        if result.source_engine == "Google Scholar" and not result.doi:
-            try:
-                # Build search query from title + first author
-                search_terms = result.title[:100] if result.title else ""
-                if result.authors and len(result.authors) > 0:
-                    # Get last name of first author
-                    first_author = result.authors[0].split()[-1]
-                    search_terms = f"{first_author} {search_terms}"
-                
-                if search_terms:
-                    crossref_match = _crossref.search(search_terms)
-                    if crossref_match and crossref_match.doi:
-                        # Verify titles match before accepting DOI
-                        if _titles_loosely_match(result.title, crossref_match.title):
-                            result.doi = crossref_match.doi
-                            result.source_engine = "Google Scholar + Crossref"
-                            print(f"[UnifiedRouter] Enriched Google Scholar with DOI: {result.doi}")
-            except Exception as e:
-                print(f"[UnifiedRouter] DOI enrichment failed: {e}")
     
     # Return best result (prefer one with DOI)
     if results:
@@ -1363,14 +731,10 @@ def _route_url(url: str) -> Optional[CitationMetadata]:
     1. Extract DOI from URL → Crossref lookup
     2. Academic publisher URL → Crossref search
     3. Medical URL → PubMed
-    4. Newspaper URL → Newspaper extractor + Claude fallback
-    5. Government URL → Government extractor + Claude fallback
-    6. Generic URL → Basic metadata extraction + Claude fallback
-    
-    UPDATED 2025-12-09: Added newspaper/government detection and Claude fallback
+    4. Newspaper URL → Newspaper extractor
+    5. Government URL → Government extractor
+    6. Generic URL → Basic metadata extraction
     """
-    from urllib.parse import urlparse
-    
     # Check for DOI in URL
     doi = extract_doi_from_url(url)
     if doi:
@@ -1415,381 +779,20 @@ def _route_url(url: str) -> Optional[CitationMetadata]:
         except Exception:
             pass
     
-    # =========================================================================
-    # ArXiv URLs
-    # =========================================================================
-    if 'arxiv.org' in url.lower():
-        print(f"[UnifiedRouter] Detected arXiv URL")
-        try:
-            result = _arxiv.search(url)
-            if result and result.has_minimum_data():
-                return result
-        except Exception as e:
-            print(f"[UnifiedRouter] arXiv lookup failed: {e}")
-    
-    # =========================================================================
-    # YouTube/Vimeo video URLs
-    # =========================================================================
-    url_lower = url.lower()
-    if 'youtube.com' in url_lower or 'youtu.be' in url_lower:
-        print(f"[UnifiedRouter] Detected YouTube URL")
-        try:
-            result = _youtube.search(url)
-            if result and result.has_minimum_data():
-                return result
-        except Exception as e:
-            print(f"[UnifiedRouter] YouTube lookup failed: {e}")
-    
-    if 'vimeo.com' in url_lower:
-        print(f"[UnifiedRouter] Detected Vimeo URL")
-        try:
-            result = _vimeo.search(url)
-            if result and result.has_minimum_data():
-                return result
-        except Exception as e:
-            print(f"[UnifiedRouter] Vimeo lookup failed: {e}")
-    
-    # =========================================================================
-    # FIX 2025-12-09: Check newspaper and government domains
-    # =========================================================================
-    
-    try:
-        parsed = urlparse(url)
-        domain = parsed.netloc.lower().replace('www.', '')
-    except:
-        domain = ""
-    
-    # Check for newspaper domains
-    newspaper_domains = [
-        'nytimes.com', 'washingtonpost.com', 'wsj.com', 'latimes.com',
-        'theguardian.com', 'bbc.com', 'bbc.co.uk', 'reuters.com', 'apnews.com',
-        'theatlantic.com', 'newyorker.com', 'economist.com', 'ft.com',
-        'politico.com', 'axios.com', 'vox.com', 'slate.com', 'salon.com',
-        'huffpost.com', 'buzzfeednews.com', 'vice.com', 'thedailybeast.com',
-        'usatoday.com', 'chicagotribune.com', 'bostonglobe.com', 'sfchronicle.com',
-        'nypost.com', 'nydailynews.com', 'newsweek.com', 'time.com',
-        'forbes.com', 'businessinsider.com', 'cnbc.com', 'bloomberg.com',
-        'cnn.com', 'foxnews.com', 'msnbc.com', 'nbcnews.com', 'cbsnews.com',
-        'abcnews.go.com', 'npr.org', 'pbs.org', 'harpers.org', 'theroot.com',
-    ]
-    
-    is_newspaper = any(news in domain for news in newspaper_domains)
-    
-    # Check for government domains (UK, US, etc.)
-    government_patterns = [
-        'gov.uk', 'nhs.uk', 'nice.org.uk', 'parliament.uk',
-        'gov.scot', 'gov.wales', '.gov', 'gc.ca', 'canada.ca',
-        'gov.au', 'govt.nz', 'gov.ie', 'europa.eu',
-    ]
-    
-    is_government = any(pattern in domain for pattern in government_patterns)
-    
-    # Route to appropriate extractor
-    if is_newspaper:
-        print(f"[UnifiedRouter] Detected newspaper URL: {domain}")
-        result = extract_by_type(url, CitationType.NEWSPAPER)
-        if result and _has_good_url_metadata(result, url):
-            return result
-        # Try Claude fallback
-        claude_result = _claude_url_fallback(url, CitationType.NEWSPAPER)
-        if claude_result:
-            return claude_result
-        return result  # Return whatever we got
-    
-    if is_government:
-        print(f"[UnifiedRouter] Detected government URL: {domain}")
-        result = extract_by_type(url, CitationType.GOVERNMENT)
-        if result and _has_good_url_metadata(result, url):
-            return result
-        # Try Claude fallback
-        claude_result = _claude_url_fallback(url, CitationType.GOVERNMENT)
-        if claude_result:
-            return claude_result
-        return result  # Return whatever we got
-    
-    # Fallback to standard extraction with Claude fallback
-    result = extract_by_type(url, CitationType.URL)
-    if result and _has_good_url_metadata(result, url):
-        return result
-    
-    # Try Claude fallback for unknown URLs
-    claude_result = _claude_url_fallback(url, CitationType.URL)
-    if claude_result:
-        return claude_result
-    
-    return result
-
-
-def _has_good_url_metadata(result: CitationMetadata, url: str) -> bool:
-    """Check if URL extraction returned meaningful data."""
-    if not result:
-        return False
-    
-    # No title at all
-    if not result.title:
-        return False
-    
-    # FIX 2025-12-09: For newspaper URLs, ALWAYS require an author
-    # This ensures Claude fallback is triggered for paywalled/blocked sites
-    if result.citation_type == CitationType.NEWSPAPER:
-        has_author = result.authors and len(result.authors) > 0
-        if not has_author:
-            print(f"[UnifiedRouter] Newspaper URL has no author, triggering Claude fallback")
-            return False
-    
-    try:
-        from urllib.parse import urlparse
-        parsed = urlparse(url)
-        domain = parsed.netloc.lower().replace('www.', '')
-        domain_base = domain.split('.')[0]  # e.g., "theatlantic" from "theatlantic.com"
-    except:
-        return True  # Can't parse, assume OK
-    
-    title_lower = result.title.lower().strip()
-    title_normalized = title_lower.replace(' ', '').replace('-', '').replace('the', '')
-    domain_normalized = domain_base.replace('the', '')
-    
-    # Title is just the domain/publication name (with or without spaces/articles)
-    if title_normalized == domain_normalized:
-        print(f"[UnifiedRouter] Title matches domain name, triggering Claude fallback")
-        return False
-    
-    # Title is very short (likely just a site name)
-    if len(result.title) < 15:
-        print(f"[UnifiedRouter] Title too short ({len(result.title)} chars), triggering Claude fallback")
-        return False
-    
-    return True
-
-
-def _claude_url_fallback(url: str, citation_type: CitationType) -> Optional[CitationMetadata]:
-    """
-    Fast URL citation lookup using Brave Search API (preferred) or Claude.
-    
-    Priority:
-    1. Brave Search API (~1-2 sec) - if BRAVE_API_KEY is set
-    2. Claude + web search (~5-15 sec) - fallback
-    3. URL path extraction (<1 sec) - last resort
-    
-    FIX 2025-12-09: Added Brave Search for ~5x faster lookups.
-    """
-    
-    # =========================================================================
-    # OPTION 1: Brave Search (fastest - ~1-2 sec)
-    # =========================================================================
-    try:
-        from engines.brave_search import search_url_fallback, BRAVE_API_KEY
-        if BRAVE_API_KEY:
-            print(f"[UnifiedRouter] Using Brave Search for URL: {url[:50]}...")
-            result = search_url_fallback(url, citation_type)
-            if result and result.title and len(result.title) > 10:
-                return result
-            print(f"[UnifiedRouter] Brave Search returned no/minimal result")
-    except ImportError:
-        pass  # Brave Search not available
-    except Exception as e:
-        print(f"[UnifiedRouter] Brave Search error: {e}")
-    
-    # =========================================================================
-    # OPTION 2: Claude + Web Search (slower - ~5-15 sec)
-    # =========================================================================
-    try:
-        from routers.claude import _get_client, CLAUDE_MODEL
-        
-        client = _get_client()
-        if client:
-            print(f"[UnifiedRouter] Using Claude web search for URL: {url[:50]}...")
-            
-            # Extract search terms from URL
-            from urllib.parse import urlparse
-            parsed = urlparse(url)
-            domain = parsed.netloc.lower().replace('www.', '')
-            path = parsed.path.strip('/')
-            
-            slug_parts = []
-            for seg in path.split('/'):
-                if '-' in seg and not seg.isdigit() and len(seg) > 5:
-                    slug_parts.append(seg.replace('-', ' '))
-            
-            search_query = f"{domain.split('.')[0]} {' '.join(slug_parts)}"
-            
-            prompt = f"""I need citation information for this URL: {url}
-
-Search for this article and provide the citation metadata. Search query hint: {search_query}
-
-After searching, respond with ONLY this JSON (no other text):
-{{
-    "title": "Full article title",
-    "authors": ["Author Name"],
-    "date": "Month DD, YYYY",
-    "publication": "Publication name",
-    "confidence": 1.0
-}}"""
-
-            response = client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=500,
-                tools=[{
-                    "type": "web_search_20250305",
-                    "name": "web_search"
-                }],
-                messages=[{"role": "user", "content": prompt}]
-            )
-            
-            text = ""
-            for block in response.content:
-                if hasattr(block, 'text'):
-                    text += block.text
-            
-            import json
-            json_match = re.search(r'\{[\s\S]*\}', text)
-            if json_match:
-                data = json.loads(json_match.group())
-                
-                title = data.get('title', '')
-                if title and len(title) > 10 and data.get('confidence', 0) >= 0.5:
-                    print(f"[UnifiedRouter] Claude found: {title[:50]}...")
-                    
-                    from datetime import datetime
-                    access_date = datetime.now().strftime('%B %d, %Y').replace(' 0', ' ')
-                    
-                    return CitationMetadata(
-                        citation_type=citation_type,
-                        raw_source=url,
-                        source_engine="Claude Web Search",
-                        url=url,
-                        title=title,
-                        authors=data.get('authors', []),
-                        date=data.get('date', ''),
-                        newspaper=data.get('publication', '') if citation_type == CitationType.NEWSPAPER else None,
-                        agency=data.get('publication', '') if citation_type == CitationType.GOVERNMENT else None,
-                        access_date=access_date,
-                    )
-                    
-    except ImportError:
-        pass
-    except Exception as e:
-        print(f"[UnifiedRouter] Claude web search error: {e}")
-    
-    # =========================================================================
-    # OPTION 3: URL Path Extraction (last resort)
-    # =========================================================================
-    return _extract_from_url_path(url, citation_type)
-
-
-def _extract_from_url_path(url: str, citation_type: CitationType) -> Optional[CitationMetadata]:
-    """
-    Extract title from URL path when all else fails.
-    
-    Converts slugs like "private-equity-housing-changes" to readable titles.
-    """
-    from urllib.parse import urlparse
-    from datetime import datetime
-    
-    try:
-        parsed = urlparse(url)
-        domain = parsed.netloc.lower().replace('www.', '')
-        path = parsed.path.strip('/')
-        
-        if not path:
-            return None
-        
-        # Split path into segments
-        segments = path.split('/')
-        
-        # Find the best segment for title (longest slug with words)
-        best_slug = None
-        for seg in reversed(segments):
-            # Skip numeric-only segments (like "685138")
-            if seg.isdigit():
-                continue
-            # Skip very short segments
-            if len(seg) < 5:
-                continue
-            # Skip date-like segments
-            if re.match(r'^\d{4}$', seg) or re.match(r'^\d{2}$', seg):
-                continue
-            # This looks like a good slug
-            if '-' in seg or '_' in seg:
-                best_slug = seg
-                break
-        
-        if not best_slug:
-            return None
-        
-        # Convert slug to title
-        title = best_slug.replace('-', ' ').replace('_', ' ')
-        # Title case, but preserve common acronyms
-        title = title.title()
-        
-        # Fix common acronyms
-        acronym_fixes = {
-            'Ai': 'AI', 'Us': 'US', 'Uk': 'UK', 'Fda': 'FDA', 'Nih': 'NIH',
-            'Cdc': 'CDC', 'Ceo': 'CEO', 'Covid': 'COVID', 'Nhs': 'NHS',
-        }
-        for wrong, right in acronym_fixes.items():
-            title = re.sub(r'\b' + wrong + r'\b', right, title)
-        
-        print(f"[UnifiedRouter] Extracted title from URL path: {title}")
-        
-        # Try to extract date from URL path (e.g., /2025/12/)
-        date_match = re.search(r'/(\d{4})/(\d{1,2})/', url)
-        date_str = ""
-        if date_match:
-            year, month = date_match.groups()
-            try:
-                from calendar import month_name
-                date_str = f"{month_name[int(month)]} {year}"
-            except:
-                date_str = f"{year}"
-        
-        # Get publication name from domain
-        domain_base = domain.split('.')[0]
-        publication = domain_base.replace('the', '').title()
-        if domain_base == 'theatlantic':
-            publication = 'The Atlantic'
-        elif domain_base == 'nytimes':
-            publication = 'New York Times'
-        elif domain_base == 'washingtonpost':
-            publication = 'Washington Post'
-        
-        access_date = datetime.now().strftime('%B %d, %Y').replace(' 0', ' ')
-        
-        return CitationMetadata(
-            citation_type=citation_type,
-            raw_source=url,
-            source_engine="URL Path Extraction",
-            url=url,
-            title=title,
-            authors=[],  # Can't get author from URL
-            date=date_str,
-            newspaper=publication if citation_type == CitationType.NEWSPAPER else None,
-            access_date=access_date,
-        )
-        
-    except Exception as e:
-        print(f"[UnifiedRouter] URL path extraction error: {e}")
-        return None
+    # Fallback to standard extraction
+    return extract_by_type(url, CitationType.URL)
 
 
 # =============================================================================
 # MAIN ROUTING FUNCTION
 # =============================================================================
 
-def route_citation(query: str, style: str = "chicago", author_date_mode: bool = False) -> Tuple[Optional[CitationMetadata], str]:
+def route_citation(query: str, style: str = "chicago") -> Tuple[Optional[CitationMetadata], str]:
     """
     Main entry point: route query to appropriate engine and format result.
     
     Returns: (CitationMetadata, formatted_citation_string)
     
-    Args:
-        query: Citation text to process
-        style: Citation style (chicago, apa, mla, bluebook, oscola)
-        author_date_mode: If True, enables AI lookup for parenthetical citations
-                          like (Simonton, 1992). User must explicitly select this
-                          mode in the UI to avoid false matches in endnote documents.
-    
-    NEW (V3.7): Added author_date_mode for parenthetical citations.
     NEW (V3.4): Tries to parse already-formatted citations first.
     If the citation is complete (has author, title, journal/publisher, year),
     it reformats without searching databases. This preserves authoritative
@@ -1809,19 +812,8 @@ def route_citation(query: str, style: str = "chicago", author_date_mode: bool = 
         print(f"[UnifiedRouter] Parsed complete citation: {parsed.citation_type.name}")
         return parsed, formatter.format(parsed)
     
-    # 0.5. PARENTHETICAL CITATIONS: (Author, Year) format - use AI lookup
-    # Only enabled when user explicitly selects Author-Date mode in UI
-    # This prevents false matches on parenthetical asides in endnote documents
-    if author_date_mode and is_parenthetical_citation(query):
-        print(f"[UnifiedRouter] Author-Date mode: detected parenthetical citation: {query}")
-        paren_meta = lookup_parenthetical_citation(query)
-        if paren_meta and paren_meta.has_minimum_data():
-            print(f"[UnifiedRouter] AI identified: {paren_meta.title[:50]}...")
-            return paren_meta, formatter.format(paren_meta)
-        print("[UnifiedRouter] AI lookup failed, continuing to other methods...")
-    
-    # 1. Check for legal citation FIRST (legal.py handles famous cases)
-    if legal.is_legal_citation(query):
+    # 1. Check for legal citation FIRST (superlegal.py handles famous cases)
+    if superlegal.is_legal_citation(query):
         metadata = _route_legal(query)
         if metadata:
             return metadata, formatter.format(metadata)
@@ -1832,17 +824,6 @@ def route_citation(query: str, style: str = "chicago", author_date_mode: bool = 
         if metadata:
             return metadata, formatter.format(metadata)
     
-    # 2.5. Claude-first guess: Use Claude's knowledge for ambiguous queries
-    # This catches fragmentary queries like "Eric Caplan trains brains" that
-    # detectors might misroute to books instead of journals
-    try:
-        claude_result = guess_and_search(query)
-        if claude_result and claude_result.has_minimum_data():
-            print(f"[UnifiedRouter] Found via Claude-first guess: {claude_result.source_engine}")
-            return claude_result, formatter.format(claude_result)
-    except Exception as e:
-        print(f"[UnifiedRouter] Claude-first guess failed: {e}")
-    
     # 3. Detect type using standard detectors
     detection = detect_type(query)
     
@@ -1852,12 +833,6 @@ def route_citation(query: str, style: str = "chicago", author_date_mode: bool = 
     
     elif detection.citation_type == CitationType.BOOK:
         metadata = _route_book(query)
-        # FIX 2025-12-09: If book search fails (validation rejected or not found),
-        # try journal engines as fallback. Fragmentary queries like "Caplan trains brains"
-        # might be journal articles misdetected as books.
-        if not metadata:
-            print(f"[UnifiedRouter] Book search failed, trying journal engines...")
-            metadata = _route_journal(query)
     
     elif detection.citation_type in [CitationType.JOURNAL, CitationType.MEDICAL]:
         # Check famous papers cache first
@@ -1956,7 +931,7 @@ def get_multiple_citations(query: str, style: str = "chicago", limit: int = 5) -
                 pass
     
     # Check for legal citation
-    if legal.is_legal_citation(query) or detection.citation_type == CitationType.LEGAL:
+    if superlegal.is_legal_citation(query) or detection.citation_type == CitationType.LEGAL:
         metadata = _route_legal(query)
         if metadata:
             formatted = formatter.format(metadata)
@@ -1982,10 +957,8 @@ def get_multiple_citations(query: str, style: str = "chicago", limit: int = 5) -
             metadatas = _crossref.search_multiple(query, limit)
             for meta in metadatas:
                 if meta and meta.has_minimum_data():
-                    # FIX 2025-12-09: Validate result matches query
-                    if _validate_journal_match(query, meta):
-                        formatted = formatter.format(meta)
-                        results.append((meta, formatted, "Crossref"))
+                    formatted = formatter.format(meta)
+                    results.append((meta, formatted, "Crossref"))
         except Exception:
             pass
         
@@ -1994,16 +967,14 @@ def get_multiple_citations(query: str, style: str = "chicago", limit: int = 5) -
             try:
                 ss_result = _semantic.search(query)
                 if ss_result and ss_result.has_minimum_data():
-                    # FIX 2025-12-09: Validate result matches query
-                    if _validate_journal_match(query, ss_result):
-                        is_duplicate = any(
-                            ss_result.title and r[0].title and 
-                            ss_result.title.lower()[:30] == r[0].title.lower()[:30]
-                            for r in results
-                        )
-                        if not is_duplicate:
-                            formatted = formatter.format(ss_result)
-                            results.append((ss_result, formatted, "Semantic Scholar"))
+                    is_duplicate = any(
+                        ss_result.title and r[0].title and 
+                        ss_result.title.lower()[:30] == r[0].title.lower()[:30]
+                        for r in results
+                    )
+                    if not is_duplicate:
+                        formatted = formatter.format(ss_result)
+                        results.append((ss_result, formatted, "Semantic Scholar"))
             except Exception:
                 pass
         
@@ -2015,9 +986,6 @@ def get_multiple_citations(query: str, style: str = "chicago", limit: int = 5) -
                 for data in book_results:
                     if len(results) >= limit:
                         break
-                    # FIX 2025-12-09: Validate book matches query before adding
-                    if not _validate_book_match(query, data):
-                        continue
                     meta = _book_dict_to_metadata(data, query)
                     if meta and meta.has_minimum_data():
                         # Check for duplicates
@@ -2042,9 +1010,6 @@ def get_multiple_citations(query: str, style: str = "chicago", limit: int = 5) -
             for data in book_results:
                 if len(results) >= limit:
                     break
-                # FIX 2025-12-09: Validate book matches query before adding
-                if not _validate_book_match(query, data):
-                    continue
                 meta = _book_dict_to_metadata(data, query)
                 if meta and meta.has_minimum_data():
                     # Check for duplicates
@@ -2269,51 +1234,78 @@ def get_citation_options_formatted(query: str, style: str = "chicago", limit: in
 
 
 # =============================================================================
+# PARENTHETICAL CITATION OPTIONS (Author-Date Mode)
+# =============================================================================
+
+def get_parenthetical_options(
+    citation_text: str, 
+    style: str = "APA 7", 
+    limit: int = 5
+) -> List[Tuple[Optional[CitationMetadata], str]]:
+    """
+    Get multiple options for a parenthetical citation like "(Simonton, 1992)".
+    
+    Used by Author-Date mode to present the user with choices since
+    authors often have multiple publications in the same year.
+    
+    Args:
+        citation_text: Text like "(Simonton, 1992)" or "(Smith & Jones, 2020)"
+        style: Citation style for formatting (default: "APA 7")
+        limit: Maximum options to return (default: 5)
+        
+    Returns:
+        List of (CitationMetadata, formatted_string) tuples.
+        First result is the AI's best guess (recommendation).
+        
+    Example:
+        >>> options = get_parenthetical_options("(Simonton, 1992)", "APA 7", 5)
+        >>> for meta, formatted in options:
+        ...     print(f"{meta.title}: {formatted}")
+    """
+    try:
+        # Import here to avoid circular imports
+        from engines.ai_lookup import lookup_parenthetical_citation_options
+        
+        # Get multiple options from AI lookup
+        metadata_list = lookup_parenthetical_citation_options(citation_text, limit=limit)
+        
+        if not metadata_list:
+            print(f"[UnifiedRouter] No options found for: {citation_text}")
+            return []
+        
+        # Format each option using the specified style
+        formatter = get_formatter(style)
+        results = []
+        
+        for meta in metadata_list:
+            try:
+                formatted = formatter.format(meta)
+                results.append((meta, formatted))
+            except Exception as e:
+                print(f"[UnifiedRouter] Error formatting option: {e}")
+                # Still include with basic format
+                basic = f"{', '.join(meta.authors)} ({meta.year}). {meta.title}."
+                results.append((meta, basic))
+        
+        print(f"[UnifiedRouter] Returning {len(results)} parenthetical options")
+        return results
+        
+    except ImportError:
+        print("[UnifiedRouter] ai_lookup module not available")
+        return []
+    except Exception as e:
+        print(f"[UnifiedRouter] Error in get_parenthetical_options: {e}")
+        return []
+
+
+# =============================================================================
 # BACKWARD COMPATIBILITY
 # =============================================================================
 
 # Alias for app.py compatibility
-def get_citation(query: str, style: str = "chicago", author_date_mode: bool = False) -> Tuple[Optional[CitationMetadata], str]:
+def get_citation(query: str, style: str = "chicago") -> Tuple[Optional[CitationMetadata], str]:
     """Alias for route_citation() - backward compatibility."""
-    return route_citation(query, style, author_date_mode)
-
-
-def get_parenthetical_options(query: str, style: str = "chicago", limit: int = 5) -> List[Tuple[CitationMetadata, str]]:
-    """
-    Get multiple citation options for a parenthetical (Author, Year) citation.
-    
-    Use this when author_date_mode is enabled to present options to the user
-    for selection, since authors often publish multiple works in the same year.
-    
-    Args:
-        query: Parenthetical citation like "(Simonton, 1992)"
-        style: Citation style for formatting
-        limit: Maximum number of options (default 5)
-        
-    Returns:
-        List of (CitationMetadata, formatted_string) tuples, ordered by likelihood
-        
-    Example:
-        >>> options = get_parenthetical_options("(Simonton, 1992)", "apa")
-        >>> for meta, formatted in options:
-        ...     print(formatted)
-    """
-    if not is_parenthetical_citation(query):
-        return []
-    
-    formatter = get_formatter(style)
-    
-    # Get multiple options from AI
-    metadatas = lookup_parenthetical_citation_options(query, limit=limit)
-    
-    # Format each option
-    results = []
-    for meta in metadatas:
-        if meta and meta.has_minimum_data():
-            formatted = formatter.format(meta)
-            results.append((meta, formatted))
-    
-    return results
+    return route_citation(query, style)
 
 
 def search_citation(query: str) -> List[dict]:
@@ -2324,8 +1316,8 @@ def search_citation(query: str) -> List[dict]:
     results = []
     
     # Try legal first
-    if legal.is_legal_citation(query):
-        data = legal.extract_metadata(query)
+    if superlegal.is_legal_citation(query):
+        data = superlegal.extract_metadata(query)
         if data:
             results.append(data)
         return results

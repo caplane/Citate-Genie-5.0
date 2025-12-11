@@ -4,13 +4,11 @@ citeflex/app.py
 Flask application for CiteFlex Unified.
 
 Version History:
-    2025-12-11: CRITICAL FIX - Author-date mode now sends ALL authors to AI lookup.
-                Previously only sent first author (e.g., "Endler, 1978"), now sends
-                full author string (e.g., "Endler, Rushton, & Roediger, 1978").
-                This dramatically improves citation matching accuracy.
-    2025-12-10: Added auto-finalize on download for author-date mode.
-                If user downloads without explicitly finalizing, the document
-                is automatically processed with selected/original citations.
+    2025-12-11: Fixed Author-Date UX to match Endnote UX:
+                - Added 'recommendation' field (AI's best guess)
+                - Original text now appears as first option (id=0)
+                - Options 1-4 are AI lookup results
+                - Each option has 'is_original' flag
     2025-12-10: Added /api/cite/parenthetical endpoint for Author-Date mode.
                 Returns multiple options for user selection.
     2025-12-06 13:30: Added debug logging to diagnose session loss issue
@@ -31,6 +29,7 @@ FIXES APPLIED:
 5. CRITICAL: /api/update now properly updates document (was silently failing)
 6. CRITICAL: /api/download now returns updated document (was returning original)
 7. DEBUG: Added logging to track session creation and lookup
+8. Author-Date UX now matches Endnote UX with recommendation + options
 """
 
 import os
@@ -468,14 +467,22 @@ def cite_parenthetical():
     {
         "success": true,
         "query": "(Simonton, 1992)",
+        "recommendation": "Simonton, D. K. (1992). Leaders of American...",
         "options": [
             {
                 "id": 0,
+                "citation": "(Simonton, 1992)",
+                "title": "[Keep Original]",
+                "source": "original",
+                "is_original": true
+            },
+            {
+                "id": 1,
                 "citation": "Simonton, D. K. (1992). Leaders of American...",
                 "title": "Leaders of American psychology...",
                 "source": "ai_lookup",
                 "confidence": "high",
-                "metadata": {...}
+                "is_original": false
             },
             ...
         ]
@@ -492,34 +499,46 @@ def cite_parenthetical():
         
         query = data['query'].strip()
         style = data.get('style', 'APA 7')
-        limit = min(data.get('limit', 5), 10)  # Cap at 10
+        limit = min(data.get('limit', 4), 10)  # Get 4 AI options (plus original = 5 total)
         
         # Get options from AI lookup
         results = get_parenthetical_options(query, style, limit)
         
-        if not results:
-            return jsonify({
-                'success': False,
-                'error': 'No matching works found',
-                'query': query
-            }), 404
+        # Build options list with original first
+        options = [{
+            'id': 0,
+            'citation': query,
+            'title': '[Keep Original]',
+            'authors': [],
+            'year': '',
+            'source': 'original',
+            'confidence': 'original',
+            'is_original': True,
+            'metadata': None
+        }]
+        
+        # Add AI results
+        for idx, (meta, formatted) in enumerate(results):
+            options.append({
+                'id': idx + 1,
+                'citation': formatted,
+                'title': meta.title if meta else '',
+                'authors': meta.authors if meta else [],
+                'year': meta.year if meta else '',
+                'source': meta.source_engine if meta else 'ai_lookup',
+                'confidence': 'high' if meta and meta.confidence >= 0.9 else 'medium' if meta and meta.confidence >= 0.6 else 'low',
+                'is_original': False,
+                'metadata': meta.to_dict() if meta else None
+            })
+        
+        # Recommendation = first AI result, or original if no AI results
+        recommendation = options[1]['citation'] if len(options) > 1 else query
         
         return jsonify({
             'success': True,
             'query': query,
-            'options': [
-                {
-                    'id': idx,
-                    'citation': formatted,
-                    'title': meta.title if meta else '',
-                    'authors': meta.authors if meta else [],
-                    'year': meta.year if meta else '',
-                    'source': meta.source_engine if meta else 'ai_lookup',
-                    'confidence': 'high' if meta.confidence >= 0.9 else 'medium' if meta.confidence >= 0.6 else 'low',
-                    'metadata': meta.to_dict() if meta else None
-                }
-                for idx, (meta, formatted) in enumerate(results)
-            ]
+            'recommendation': recommendation,
+            'options': options
         })
         
     except Exception as e:
@@ -656,41 +675,6 @@ def download(session_id: str):
         
         processed_doc = session_data.get('processed_doc')
         filename = session_data.get('filename', 'processed.docx')
-        
-        # Auto-finalize for author-date mode if not already finalized
-        if not processed_doc and session_data.get('mode') == 'author-date':
-            print(f"[API] Auto-finalizing author-date session {session_id[:8]}...")
-            original_bytes = session_data.get('original_bytes')
-            citations = session_data.get('citations', [])
-            
-            if original_bytes:
-                # For author-date mode, we append a References section
-                # The in-text citations stay as-is; we generate the reference list
-                from processors.author_date import append_references_section, deduplicate_references
-                
-                # Collect formatted references (use first option or skip if none)
-                references = []
-                for citation in citations:
-                    options = citation.get('options', [])
-                    if options:
-                        # Use selected option if available, otherwise first option
-                        selected = citation.get('selected') or options[0]
-                        formatted = selected.get('formatted', '')
-                        if formatted:
-                            references.append(formatted)
-                
-                # Deduplicate and sort references
-                references = deduplicate_references(references)
-                
-                # Append references section to document
-                if references:
-                    processed_doc = append_references_section(original_bytes, references)
-                else:
-                    # No references to add, return original
-                    processed_doc = original_bytes
-                
-                sessions.set(session_id, 'processed_doc', processed_doc)
-                print(f"[API] Auto-finalized with {len(references)} references")
         
         if not processed_doc:
             return jsonify({
@@ -918,44 +902,46 @@ def process_author_date():
         # Read file bytes
         file_bytes = file.read()
         
-        # Extract author-date citations from document BODY TEXT (not notes!)
-        from processors.author_year_extractor import AuthorDateExtractor
+        # Extract citations from document
+        from document_processor import WordDocumentProcessor
+        from io import BytesIO
         
-        extractor = AuthorDateExtractor()
-        extracted_citations = extractor.extract_citations_from_docx(file_bytes)
-        unique_citations = extractor.get_unique_citations(extracted_citations)
+        processor = WordDocumentProcessor(BytesIO(file_bytes))
+        endnotes = processor.get_endnotes()
+        footnotes = processor.get_footnotes()
+        processor.cleanup()
         
-        print(f"[API] Extracted {len(extracted_citations)} citations, {len(unique_citations)} unique")
+        all_notes = endnotes + footnotes
         
-        # Process each unique citation to get options
+        # Process each citation to get options
         citations = []
-        for idx, citation in enumerate(unique_citations):
-            # Build search query from extracted citation using ALL available authors
-            # Note: raw_text may contain multiple citations if from a multi-citation 
-            # parenthetical, so we reconstruct the query from parsed fields instead
-            if citation.third_author:
-                # Three or more authors: "Endler, Rushton, & Roediger, 1978"
-                query_text = f"({citation.author}, {citation.second_author}, & {citation.third_author}, {citation.year})"
-            elif citation.second_author:
-                # Two authors: "Smith & Jones, 2020"
-                query_text = f"({citation.author} & {citation.second_author}, {citation.year})"
-            elif citation.is_et_al:
-                # et al. case: "Smith et al., 2020"
-                query_text = f"({citation.author} et al., {citation.year})"
-            else:
-                # Single author: "Smith, 2020"
-                query_text = f"({citation.author}, {citation.year})"
-            
-            original_text = query_text
-            print(f"[API] Looking up: {query_text}")
+        for idx, note in enumerate(all_notes):
+            original_text = note['text']
+            note_id = note['id']
             
             # Get multiple options for this citation
             try:
-                options = get_parenthetical_options(original_text, style, limit=5)
+                options = get_parenthetical_options(original_text, style, limit=4)  # Get 4 AI options
                 
-                formatted_options = []
-                for meta, formatted in options:
+                # Build formatted options list
+                # Option 0: Original text (keep unchanged)
+                formatted_options = [{
+                    'id': 0,
+                    'title': '[Keep Original]',
+                    'formatted': original_text,
+                    'authors': [],
+                    'year': '',
+                    'journal': '',
+                    'publisher': '',
+                    'doi': '',
+                    'source': 'original',
+                    'is_original': True
+                }]
+                
+                # Options 1-4: AI lookup results
+                for opt_idx, (meta, formatted) in enumerate(options):
                     formatted_options.append({
+                        'id': opt_idx + 1,
                         'title': meta.title if meta else '',
                         'formatted': formatted,
                         'authors': meta.authors if meta else [],
@@ -963,26 +949,41 @@ def process_author_date():
                         'journal': getattr(meta, 'journal', '') or '',
                         'publisher': getattr(meta, 'publisher', '') or '',
                         'doi': getattr(meta, 'doi', '') or '',
-                        'source': getattr(meta, 'source_engine', 'Unknown')
+                        'source': getattr(meta, 'source_engine', 'Unknown'),
+                        'is_original': False
                     })
+                
+                # Recommendation = first AI result (option 1), or original if no AI results
+                recommendation = formatted_options[1]['formatted'] if len(formatted_options) > 1 else original_text
                 
                 citations.append({
                     'id': idx + 1,
-                    'author': citation.author,
-                    'year': citation.year,
+                    'note_id': note_id,
                     'original': original_text,
+                    'recommendation': recommendation,
                     'options': formatted_options
                 })
                 
             except Exception as e:
                 print(f"[API] Error getting options for '{original_text[:40]}': {e}")
-                # Still include the citation, just with no options
+                # Still include the citation with original as only option
                 citations.append({
                     'id': idx + 1,
-                    'author': citation.author,
-                    'year': citation.year,
+                    'note_id': note_id,
                     'original': original_text,
-                    'options': [],
+                    'recommendation': original_text,  # Fallback to original
+                    'options': [{
+                        'id': 0,
+                        'title': '[Keep Original]',
+                        'formatted': original_text,
+                        'authors': [],
+                        'year': '',
+                        'journal': '',
+                        'publisher': '',
+                        'doi': '',
+                        'source': 'original',
+                        'is_original': True
+                    }],
                     'error': str(e)
                 })
         
@@ -1147,28 +1148,27 @@ def finalize_author_date():
             }), 404
         
         # Process the document with selected citations
-        # For author-date mode, we append a References section
-        from processors.author_date import append_references_section, deduplicate_references
+        from document_processor import WordDocumentProcessor
+        from io import BytesIO
         
-        # Collect formatted references from selected options
-        references = []
+        processor = WordDocumentProcessor(BytesIO(original_bytes))
+        
+        # Update each note with its selected citation
         for citation in citations:
-            options = citation.get('options', [])
-            if options:
-                # Use selected option if available, otherwise first option
-                selected = citation.get('selected') or options[0]
-                formatted = selected.get('formatted', '')
-                if formatted:
-                    references.append(formatted)
+            note_id = citation.get('note_id')
+            formatted = citation.get('formatted') or citation.get('original')
+            
+            if note_id and formatted:
+                # Try endnote first, then footnote
+                if not processor.write_endnote(note_id, formatted):
+                    processor.write_footnote(note_id, formatted)
         
-        # Deduplicate and sort references
-        references = deduplicate_references(references)
+        # Save to buffer
+        doc_buffer = processor.save_to_buffer()
+        processor.cleanup()
         
-        # Append references section to document
-        if references:
-            processed_bytes = append_references_section(original_bytes, references)
-        else:
-            processed_bytes = original_bytes
+        # Store processed document
+        processed_bytes = doc_buffer.read()
         sessions.set(session_id, 'processed_doc', processed_bytes)
         
         return jsonify({
