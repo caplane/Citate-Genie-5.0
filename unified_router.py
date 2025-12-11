@@ -234,7 +234,7 @@ def _parse_journal_citation(query: str) -> Optional[CitationMetadata]:
     """
     # Extract DOI if present (do this first, then remove from parsing)
     doi = None
-    doi_match = re.search(r'(?:https?://)?(?:dx\.)?doi\.org/([^\s,\.]+[^\s,\.\)])', query)
+    doi_match = re.search(r'(?:https?://)?(?:dx\.)?doi\.org/(10\.[^\s,]+)', query)
     if doi_match:
         doi = doi_match.group(1).rstrip('.')
     

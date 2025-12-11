@@ -42,7 +42,7 @@ LEGAL_PATTERNS = [
     re.compile(r'\d+\s+F\.?\s*Supp\.?\s*(?:2d|3d)?\s+\d+'),  # Federal Supplement
     re.compile(r'\d+\s+[A-Z][a-z]*\.?\s*(?:2d|3d)?\s+\d+'),  # State reporters
     re.compile(r'\bv\.\s+', re.IGNORECASE),  # Case name indicator
-    re.compile(r'\[\d{4}\]\s+[A-Z]+\s+\d+'),  # UK neutral citation [2024] UKSC 1
+    re.compile(r'\[\d{4}\]\s+[A-Z]+(?:\s+[A-Za-z]+)*\s+\d+'),  # UK neutral citation [2024] UKSC 1, [2023] EWCA Civ 123, [2022] EWHC 456 (Ch)
 ]
 
 # Book patterns
