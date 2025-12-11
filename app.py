@@ -4,6 +4,10 @@ citeflex/app.py
 Flask application for CiteFlex Unified.
 
 Version History:
+    2025-12-11: CRITICAL FIX - Author-date mode now sends ALL authors to AI lookup.
+                Previously only sent first author (e.g., "Endler, 1978"), now sends
+                full author string (e.g., "Endler, Rushton, & Roediger, 1978").
+                This dramatically improves citation matching accuracy.
     2025-12-10: Added auto-finalize on download for author-date mode.
                 If user downloads without explicitly finalizing, the document
                 is automatically processed with selected/original citations.
@@ -926,8 +930,24 @@ def process_author_date():
         # Process each unique citation to get options
         citations = []
         for idx, citation in enumerate(unique_citations):
-            # Build search query from extracted citation
-            original_text = citation.raw_text or f"({citation.author}, {citation.year})"
+            # Build search query from extracted citation using ALL available authors
+            # Note: raw_text may contain multiple citations if from a multi-citation 
+            # parenthetical, so we reconstruct the query from parsed fields instead
+            if citation.third_author:
+                # Three or more authors: "Endler, Rushton, & Roediger, 1978"
+                query_text = f"({citation.author}, {citation.second_author}, & {citation.third_author}, {citation.year})"
+            elif citation.second_author:
+                # Two authors: "Smith & Jones, 2020"
+                query_text = f"({citation.author} & {citation.second_author}, {citation.year})"
+            elif citation.is_et_al:
+                # et al. case: "Smith et al., 2020"
+                query_text = f"({citation.author} et al., {citation.year})"
+            else:
+                # Single author: "Smith, 2020"
+                query_text = f"({citation.author}, {citation.year})"
+            
+            original_text = query_text
+            print(f"[API] Looking up: {query_text}")
             
             # Get multiple options for this citation
             try:
