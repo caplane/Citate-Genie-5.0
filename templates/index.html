@@ -733,11 +733,11 @@
             const empty = document.getElementById('list-empty');
             
             if (currentCitations.length === 0) {
-                empty.classList.remove('hidden');
+                if (empty) empty.classList.remove('hidden');
                 return;
             }
             
-            empty.classList.add('hidden');
+            if (empty) empty.classList.add('hidden');
             list.innerHTML = currentCitations.map((c, idx) => {
                 const statusClass = c.success ? 'status-success' : 'status-pending';
                 const badgeClass = `badge-${c.type || 'unknown'}`;
@@ -764,11 +764,11 @@
             const empty = document.getElementById('list-empty');
             
             if (currentReferences.length === 0) {
-                empty.classList.remove('hidden');
+                if (empty) empty.classList.remove('hidden');
                 return;
             }
             
-            empty.classList.add('hidden');
+            if (empty) empty.classList.add('hidden');
             list.innerHTML = currentReferences.map((ref, idx) => {
                 const isActive = idx === adActiveRefIndex;
                 const statusClass = ref.accepted ? 'status-success' : (ref.found ? 'status-pending' : 'status-error');
@@ -1001,6 +1001,23 @@
             ref.formatted = finalText;
             ref.accepted = true;
             
+            // Persist to server
+            if (sessionId) {
+                try {
+                    await fetch('/api/accept-reference', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            session_id: sessionId,
+                            reference_id: ref.id,
+                            formatted: finalText
+                        })
+                    });
+                } catch (err) {
+                    console.error('Failed to persist reference:', err);
+                }
+            }
+            
             // Update sidebar
             renderReferenceSidebar();
             
@@ -1094,7 +1111,15 @@
             document.getElementById('next-btn').disabled = activeNoteIndex >= currentCitations.length - 1;
         }
         
-        function navigateCitation(delta) {
+        async function navigateCitation(delta) {
+            // Auto-save current before navigating
+            if (activeNoteId && sessionId) {
+                const textarea = document.getElementById('final-edit-area');
+                if (textarea && textarea.value.trim()) {
+                    await commitChange(true);  // silent = true
+                }
+            }
+            
             const newIdx = activeNoteIndex + delta;
             if (newIdx >= 0 && newIdx < currentCitations.length) {
                 loadEditor(currentCitations[newIdx], newIdx);
@@ -1163,16 +1188,19 @@
             }
         }
 
-        async function commitChange() {
+        async function commitChange(silent = false) {
             if (!activeNoteId || !sessionId) {
-                showToast('No citation selected');
+                if (!silent) showToast('No citation selected');
                 return;
             }
             
             const btn = document.getElementById('commit-btn');
             const originalHtml = btn.innerHTML;
-            btn.innerHTML = '<div class="loader mx-auto"></div>';
-            btn.disabled = true;
+            
+            if (!silent) {
+                btn.innerHTML = '<div class="loader mx-auto"></div>';
+                btn.disabled = true;
+            }
             
             const newText = document.getElementById('final-edit-area').value;
             
@@ -1206,30 +1234,36 @@
                     document.getElementById('success-count').innerText = `${successCount} done`;
                     document.getElementById('success-count').classList.remove('hidden');
                     
-                    btn.innerHTML = `<i class="fas fa-check"></i> Saved!`;
-                    btn.classList.remove('from-blue-600', 'to-indigo-600');
-                    btn.classList.add('from-green-600', 'to-emerald-600');
-                    
-                    setTimeout(() => {
-                        btn.innerHTML = originalHtml;
-                        btn.classList.remove('from-green-600', 'to-emerald-600');
-                        btn.classList.add('from-blue-600', 'to-indigo-600');
-                        btn.disabled = false;
+                    if (!silent) {
+                        btn.innerHTML = `<i class="fas fa-check"></i> Saved!`;
+                        btn.classList.remove('from-blue-600', 'to-indigo-600');
+                        btn.classList.add('from-green-600', 'to-emerald-600');
                         
-                        if (activeNoteIndex < currentCitations.length - 1) {
-                            navigateCitation(1);
-                        }
-                    }, 1000);
+                        setTimeout(() => {
+                            btn.innerHTML = originalHtml;
+                            btn.classList.remove('from-green-600', 'to-emerald-600');
+                            btn.classList.add('from-blue-600', 'to-indigo-600');
+                            btn.disabled = false;
+                            
+                            if (activeNoteIndex < currentCitations.length - 1) {
+                                navigateCitation(1);
+                            }
+                        }, 1000);
+                    }
                 } else {
-                    btn.innerHTML = originalHtml;
-                    btn.disabled = false;
-                    alert('Failed to save: ' + data.error);
+                    if (!silent) {
+                        btn.innerHTML = originalHtml;
+                        btn.disabled = false;
+                        alert('Failed to save: ' + data.error);
+                    }
                 }
             } catch (err) {
-                btn.innerHTML = originalHtml;
-                btn.disabled = false;
-                console.error(err);
-                alert('Failed to save changes');
+                if (!silent) {
+                    btn.innerHTML = originalHtml;
+                    btn.disabled = false;
+                    console.error(err);
+                    alert('Failed to save changes');
+                }
             }
         }
 
@@ -1241,14 +1275,29 @@
             activeNoteId = null;
             activeNoteIndex = -1;
             activeRefIndex = -1;
+            adActiveRefIndex = -1;  // Reset author-date mode state
             successCount = 0;
             
             document.getElementById('file-info').classList.add('hidden');
             document.getElementById('download-area').classList.add('hidden');
             document.getElementById('success-count').classList.add('hidden');
             document.getElementById('citation-count').innerText = '0 total';
-            document.getElementById('list-empty').classList.remove('hidden');
-            document.getElementById('citation-list').innerHTML = document.getElementById('list-empty').outerHTML;
+            
+            // Recreate list-empty if it was removed by sidebar rendering
+            const listEmpty = document.getElementById('list-empty');
+            const citationList = document.getElementById('citation-list');
+            if (listEmpty) {
+                listEmpty.classList.remove('hidden');
+            }
+            // Reset citation list to contain empty placeholder
+            citationList.innerHTML = `
+                <div id="list-empty" class="text-center py-12 text-gray-400">
+                    <i class="fas fa-inbox text-4xl mb-3 opacity-30"></i>
+                    <p class="text-sm font-medium">Upload a document to begin</p>
+                    <p id="list-empty-hint" class="text-xs mt-1">${currentMode === 'footnote' ? 'Endnotes and footnotes will appear here' : 'In-text citations will appear here'}</p>
+                </div>
+            `;
+            
             document.getElementById('editor-empty').classList.remove('hidden');
             document.getElementById('editor-active').classList.add('hidden');
             document.getElementById('author-date-results').classList.add('hidden');
@@ -1274,6 +1323,40 @@
                 showToast('No document loaded');
                 return;
             }
+            
+            // For author-date mode, finalize the document first
+            if (currentMode === 'author-date') {
+                showToast('Preparing document...');
+                
+                // Collect all references with their formatted text
+                const references = currentReferences.map(ref => ({
+                    original: ref.original,
+                    formatted: ref.formatted || ref.original
+                }));
+                
+                try {
+                    const res = await fetch('/api/finalize-author-date', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            session_id: sessionId,
+                            references: references
+                        })
+                    });
+                    
+                    const data = await res.json();
+                    
+                    if (!data.success) {
+                        showToast('Error: ' + (data.error || 'Failed to finalize'));
+                        return;
+                    }
+                } catch (err) {
+                    console.error('Finalize error:', err);
+                    showToast('Error preparing document');
+                    return;
+                }
+            }
+            
             window.location.href = `/api/download/${sessionId}`;
         }
 
