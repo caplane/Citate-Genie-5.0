@@ -68,7 +68,7 @@ AI_ROUTER = os.environ.get('AI_ROUTER', 'claude').lower()  # 'claude' or 'gemini
 
 # Try to import Claude router (primary)
 try:
-    from claude_router import classify_with_claude, get_citation_options
+    from routers.claude import classify_with_claude, get_citation_options
     CLAUDE_AVAILABLE = True
 except ImportError:
     CLAUDE_AVAILABLE = False
@@ -76,7 +76,7 @@ except ImportError:
 
 # Try to import Gemini router (fallback)
 try:
-    from gemini_router import classify_with_gemini
+    from routers.gemini import classify_with_gemini
     GEMINI_AVAILABLE = True
 except ImportError:
     GEMINI_AVAILABLE = False
@@ -1207,7 +1207,7 @@ def get_citation_options_formatted(query: str, style: str = "chicago", limit: in
     This is the preferred method for ambiguous queries like "Caplan mind games".
     Returns list of dicts with {citation, source, title, authors, year, ...}.
     
-    Uses claude_router.get_citation_options() which searches:
+    Uses routers.claude.get_citation_options() which searches:
     - Google Books
     - Crossref  
     - PubMed
@@ -1264,7 +1264,7 @@ def get_parenthetical_options(
     """
     try:
         # Import here to avoid circular imports
-        from engines.ai_lookup import lookup_parenthetical_citation_options
+        from routers.chat_gpt_router import lookup_parenthetical_citation_options
         
         # Get multiple options from AI lookup
         metadata_list = lookup_parenthetical_citation_options(citation_text, limit=limit)
@@ -1291,7 +1291,7 @@ def get_parenthetical_options(
         return results
         
     except ImportError:
-        print("[UnifiedRouter] ai_lookup module not available")
+        print("[UnifiedRouter] chat_gpt_router module not available")
         return []
     except Exception as e:
         print(f"[UnifiedRouter] Error in get_parenthetical_options: {e}")
