@@ -1023,11 +1023,16 @@ def process_author_date():
         
         def process_single_citation(idx, cite):
             """Process one citation - called in parallel. Returns raw metadata."""
-            if cite.is_et_al:
-                original_text = f"({cite.author} et al., {cite.year})"
+            # Preserve ALL author names for better AI lookup accuracy
+            # Don't simplify to "et al." - send full author list
+            if cite.third_author:
+                # Three or more authors - include all three for better matching
+                original_text = f"({cite.author}, {cite.second_author}, & {cite.third_author}, {cite.year})"
             elif cite.second_author:
+                # Two authors
                 original_text = f"({cite.author} & {cite.second_author}, {cite.year})"
             else:
+                # Single author
                 original_text = f"({cite.author}, {cite.year})"
             
             note_id = idx + 1
