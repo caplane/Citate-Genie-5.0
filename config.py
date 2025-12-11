@@ -16,11 +16,11 @@ from typing import Dict
 # API KEYS (from environment)
 # =============================================================================
 
-# AI/LLM API Keys (with .lstrip('=') to handle copy-paste artifacts)
+# AI/LLM API Keys (strip whitespace and leading '=' from copy-paste artifacts)
 _raw_openai = os.environ.get('OPENAI_API_KEY', '')
 _raw_anthropic = os.environ.get('ANTHROPIC_API_KEY', '')
-OPENAI_API_KEY = _raw_openai.lstrip('=')
-ANTHROPIC_API_KEY = _raw_anthropic.lstrip('=')
+OPENAI_API_KEY = _raw_openai.strip().lstrip('=')
+ANTHROPIC_API_KEY = _raw_anthropic.strip().lstrip('=')
 
 # Debug: Log if we stripped anything
 if _raw_openai.startswith('='):
