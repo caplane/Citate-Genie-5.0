@@ -472,7 +472,7 @@ class AuthorDateEngine:
         import os
         results = []
         
-        api_key = os.environ.get('OPENAI_API_KEY', '').lstrip('=')
+        api_key = os.environ.get('OPENAI_API_KEY', '').strip().lstrip('=')
         if not api_key:
             print("[AuthorDateEngine] GPT-4o: No OPENAI_API_KEY set")
             return results
