@@ -902,16 +902,22 @@ def process_author_date():
         # Read file bytes
         file_bytes = file.read()
         
-        # Extract citations from document
-        from document_processor import WordDocumentProcessor
-        from io import BytesIO
+        # Extract author-date citations from document BODY TEXT (not endnotes/footnotes)
+        from author_year_extractor import AuthorDateExtractor
         
-        processor = WordDocumentProcessor(BytesIO(file_bytes))
-        endnotes = processor.get_endnotes()
-        footnotes = processor.get_footnotes()
-        processor.cleanup()
+        extractor = AuthorDateExtractor()
+        extracted_citations = extractor.extract_citations_from_docx(file_bytes)
         
-        all_notes = endnotes + footnotes
+        print(f"[API] Extracted {len(extracted_citations)} author-date citations from body text")
+        
+        # Convert to the format expected by the rest of the code
+        # Each note needs 'id' and 'text' fields
+        all_notes = []
+        for idx, citation in enumerate(extracted_citations):
+            all_notes.append({
+                'id': str(idx + 1),
+                'text': citation.raw_text  # The original "(Author, Year)" text
+            })
         
         # Process each citation to get options
         citations = []
