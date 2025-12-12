@@ -903,7 +903,7 @@ def process_author_date():
         file_bytes = file.read()
         
         # Extract author-date citations from document BODY TEXT (not endnotes/footnotes)
-        from author_year_extractor import AuthorDateExtractor
+        from processors.author_year_extractor import AuthorDateExtractor
         
         extractor = AuthorDateExtractor()
         extracted_citations = extractor.extract_citations_from_docx(file_bytes)
