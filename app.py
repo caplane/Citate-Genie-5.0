@@ -1401,6 +1401,11 @@ def finalize_author_date():
                         zf.write(file_path, arcname)
             
             output_buffer.seek(0)
+            
+            # Apply LinkActivator to make URLs clickable (same as footnote workflow)
+            from document_processor import LinkActivator
+            output_buffer = LinkActivator.process(output_buffer)
+            
             processed_bytes = output_buffer.read()
             
             # Save to session for download
