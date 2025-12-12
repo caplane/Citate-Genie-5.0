@@ -1167,10 +1167,6 @@ def finalize_author_date():
         doc_buffer = processor.save_to_buffer()
         processor.cleanup()
         
-        # Activate URLs as clickable hyperlinks (same as endnote workflow)
-        from document_processor import LinkActivator
-        doc_buffer = LinkActivator.process(doc_buffer)
-        
         # Store processed document
         processed_bytes = doc_buffer.read()
         sessions.set(session_id, 'processed_doc', processed_bytes)
