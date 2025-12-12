@@ -1,3 +1,4 @@
+
 """
 citeflex/app.py
 
@@ -44,7 +45,8 @@ from functools import wraps
 from flask import Flask, request, jsonify, render_template, send_file
 from werkzeug.utils import secure_filename
 
-from unified_router import get_citation, get_multiple_citations, get_parenthetical_options
+from unified_router import get_citation, get_multiple_citations, get_parenthetical_options, get_parenthetical_metadata
+from formatters.base import get_formatter
 from document_processor import process_document
 
 # =============================================================================
@@ -549,6 +551,112 @@ def cite_parenthetical():
         }), 500
 
 
+@app.route('/api/format-citation', methods=['POST'])
+def format_citation():
+    """
+    Format a citation from raw metadata.
+    
+    Called when user clicks Accept & Save - this is when formatting happens.
+    
+    Request JSON:
+    {
+        "metadata": {
+            "title": "The Social Context of Genius",
+            "authors": ["Simonton, Dean Keith"],
+            "year": "1992",
+            "journal": "Psychological Bulletin",
+            "volume": "104",
+            "issue": "2",
+            "pages": "251-267",
+            "doi": "10.1037/0033-2909.104.2.251",
+            "citation_type": "journal"
+        },
+        "style": "APA 7"
+    }
+    
+    Response JSON:
+    {
+        "success": true,
+        "formatted": "Simonton, D. K. (1992). The social context..."
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        if not data or not data.get('metadata'):
+            return jsonify({
+                'success': False,
+                'error': 'Missing metadata'
+            }), 400
+        
+        meta_dict = data['metadata']
+        style = data.get('style', 'APA 7')
+        
+        # Handle "keep original" case
+        if meta_dict.get('is_original') or meta_dict.get('citation_type') == 'original':
+            # Return the original text as-is (no formatting needed)
+            return jsonify({
+                'success': True,
+                'formatted': meta_dict.get('title', '')  # title holds original text for this case
+            })
+        
+        # Convert dict to CitationMetadata
+        from models import CitationMetadata, CitationType
+        
+        # Map citation_type string to enum
+        type_map = {
+            'journal': CitationType.JOURNAL,
+            'book': CitationType.BOOK,
+            'legal': CitationType.LEGAL,
+            'interview': CitationType.INTERVIEW,
+            'letter': CitationType.LETTER,
+            'newspaper': CitationType.NEWSPAPER,
+            'government': CitationType.GOVERNMENT,
+            'medical': CitationType.MEDICAL,
+            'url': CitationType.URL,
+            'unknown': CitationType.UNKNOWN,
+        }
+        
+        citation_type = type_map.get(
+            meta_dict.get('citation_type', 'unknown').lower(),
+            CitationType.UNKNOWN
+        )
+        
+        metadata = CitationMetadata(
+            citation_type=citation_type,
+            title=meta_dict.get('title', ''),
+            authors=meta_dict.get('authors', []),
+            year=meta_dict.get('year', ''),
+            journal=meta_dict.get('journal', ''),
+            volume=meta_dict.get('volume', ''),
+            issue=meta_dict.get('issue', ''),
+            pages=meta_dict.get('pages', ''),
+            doi=meta_dict.get('doi', ''),
+            url=meta_dict.get('url', ''),
+            publisher=meta_dict.get('publisher', ''),
+            place=meta_dict.get('place', ''),
+            source_engine=meta_dict.get('source', 'manual')
+        )
+        
+        # Get formatter and format
+        formatter = get_formatter(style)
+        formatted = formatter.format(metadata)
+        
+        return jsonify({
+            'success': True,
+            'formatted': formatted
+        })
+        
+    except Exception as e:
+        print(f"[API] Error in /api/format-citation: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
 @app.route('/api/process', methods=['POST'])
 def process_doc():
     """
@@ -902,96 +1010,123 @@ def process_author_date():
         # Read file bytes
         file_bytes = file.read()
         
-        # Extract author-date citations from document BODY TEXT (not endnotes/footnotes)
+        # Extract author-date citations from document BODY TEXT
         from processors.author_year_extractor import AuthorDateExtractor
         
         extractor = AuthorDateExtractor()
         extracted_citations = extractor.extract_citations_from_docx(file_bytes)
+        unique_citations = extractor.get_unique_citations(extracted_citations)
         
-        print(f"[API] Extracted {len(extracted_citations)} author-date citations from body text")
+        print(f"[API] Extracted {len(extracted_citations)} citations, {len(unique_citations)} unique")
         
-        # Convert to the format expected by the rest of the code
-        # Each note needs 'id' and 'text' fields
-        all_notes = []
-        for idx, citation in enumerate(extracted_citations):
-            all_notes.append({
-                'id': str(idx + 1),
-                'text': citation.raw_text  # The original "(Author, Year)" text
-            })
+        # Process citations in PARALLEL for speed
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         
-        # Process each citation to get options
-        citations = []
-        for idx, note in enumerate(all_notes):
-            original_text = note['text']
-            note_id = note['id']
+        def process_single_citation(idx, cite):
+            """Process one citation - called in parallel. Returns raw metadata."""
+            # Preserve ALL author names for better AI lookup accuracy
+            # Don't simplify to "et al." - send full author list
+            if cite.third_author:
+                # Three or more authors - include all three for better matching
+                original_text = f"({cite.author}, {cite.second_author}, & {cite.third_author}, {cite.year})"
+            elif cite.second_author:
+                # Two authors
+                original_text = f"({cite.author} & {cite.second_author}, {cite.year})"
+            else:
+                # Single author
+                original_text = f"({cite.author}, {cite.year})"
             
-            # Get multiple options for this citation
+            note_id = idx + 1
+            
             try:
-                options = get_parenthetical_options(original_text, style, limit=4)  # Get 4 AI options
+                # Get raw metadata (no formatting yet)
+                metadata_list = get_parenthetical_metadata(original_text, limit=4)
                 
-                # Build formatted options list
-                # Option 0: Original text (keep unchanged)
-                formatted_options = [{
+                # Build options with raw metadata
+                options = [{
                     'id': 0,
                     'title': '[Keep Original]',
-                    'formatted': original_text,
                     'authors': [],
                     'year': '',
                     'journal': '',
                     'publisher': '',
+                    'volume': '',
+                    'issue': '',
+                    'pages': '',
                     'doi': '',
+                    'url': '',
+                    'citation_type': 'original',
                     'source': 'original',
                     'is_original': True
                 }]
                 
-                # Options 1-4: AI lookup results
-                for opt_idx, (meta, formatted) in enumerate(options):
-                    formatted_options.append({
+                for opt_idx, meta in enumerate(metadata_list):
+                    options.append({
                         'id': opt_idx + 1,
                         'title': meta.title if meta else '',
-                        'formatted': formatted,
                         'authors': meta.authors if meta else [],
                         'year': meta.year if meta else '',
                         'journal': getattr(meta, 'journal', '') or '',
                         'publisher': getattr(meta, 'publisher', '') or '',
+                        'volume': getattr(meta, 'volume', '') or '',
+                        'issue': getattr(meta, 'issue', '') or '',
+                        'pages': getattr(meta, 'pages', '') or '',
                         'doi': getattr(meta, 'doi', '') or '',
-                        'source': getattr(meta, 'source_engine', 'Unknown'),
+                        'url': getattr(meta, 'url', '') or '',
+                        'citation_type': meta.citation_type.name.lower() if meta and meta.citation_type else 'unknown',
+                        'source': getattr(meta, 'source_engine', 'ai_lookup'),
                         'is_original': False
                     })
                 
-                # Recommendation = first AI result (option 1), or original if no AI results
-                recommendation = formatted_options[1]['formatted'] if len(formatted_options) > 1 else original_text
-                
-                citations.append({
+                return {
                     'id': idx + 1,
                     'note_id': note_id,
                     'original': original_text,
-                    'recommendation': recommendation,
-                    'options': formatted_options
-                })
+                    'options': options,
+                    'selected_option': 1 if len(options) > 1 else 0,  # Default to first AI result
+                    'formatted': None,  # Will be set when user accepts
+                    'accepted': False
+                }
                 
             except Exception as e:
-                print(f"[API] Error getting options for '{original_text[:40]}': {e}")
-                # Still include the citation with original as only option
-                citations.append({
+                print(f"[API] Error processing '{original_text[:40]}': {e}")
+                return {
                     'id': idx + 1,
                     'note_id': note_id,
                     'original': original_text,
-                    'recommendation': original_text,  # Fallback to original
                     'options': [{
                         'id': 0,
                         'title': '[Keep Original]',
-                        'formatted': original_text,
                         'authors': [],
                         'year': '',
                         'journal': '',
                         'publisher': '',
+                        'volume': '',
+                        'issue': '',
+                        'pages': '',
                         'doi': '',
+                        'url': '',
+                        'citation_type': 'original',
                         'source': 'original',
                         'is_original': True
                     }],
+                    'selected_option': 0,
+                    'formatted': None,
+                    'accepted': False,
                     'error': str(e)
-                })
+                }
+        
+        # Run lookups in parallel (up to 5 concurrent)
+        citations = [None] * len(unique_citations)
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(process_single_citation, idx, cite): idx 
+                for idx, cite in enumerate(unique_citations)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                citations[idx] = future.result()
+                print(f"[API] Completed citation {idx + 1}/{len(unique_citations)}")
         
         # Create session to store results
         session_id = sessions.create()
@@ -1006,16 +1141,283 @@ def process_author_date():
         return jsonify({
             'success': True,
             'session_id': session_id,
-            'references': citations,  # Frontend expects 'references' not 'citations'
+            'citations': citations,
             'stats': {
                 'total': len(citations),
-                'resolved': sum(1 for c in citations if c.get('options')),  # Frontend expects 'resolved'
-                'failed': sum(1 for c in citations if not c.get('options'))  # Frontend expects 'failed'
+                'with_options': sum(1 for c in citations if len(c.get('options', [])) > 1),
+                'no_options': sum(1 for c in citations if len(c.get('options', [])) <= 1)
             }
         })
         
     except Exception as e:
         print(f"[API] Error in /api/process-author-date: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/accept-reference', methods=['POST'])
+def accept_reference():
+    """
+    Accept/save a formatted reference for author-date mode.
+    
+    Called when user clicks Accept & Save OR auto-saves on navigation.
+    Persists the formatted text to server session.
+    
+    Request JSON:
+    {
+        "session_id": "uuid",
+        "reference_id": 1,
+        "formatted": "Simonton, D. K. (1992). The social context..."
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({
+                'success': False,
+                'error': 'Missing request data'
+            }), 400
+        
+        session_id = data.get('session_id')
+        reference_id = data.get('reference_id')
+        formatted = data.get('formatted', '')
+        
+        if not session_id or reference_id is None:
+            return jsonify({
+                'success': False,
+                'error': 'Missing session_id or reference_id'
+            }), 400
+        
+        session_data = sessions.get(session_id)
+        
+        if not session_data:
+            return jsonify({
+                'success': False,
+                'error': 'Session not found or expired'
+            }), 404
+        
+        # Get or create accepted_references dict
+        accepted_refs = session_data.get('accepted_references', {})
+        
+        # Store the formatted reference (keyed by reference_id)
+        accepted_refs[str(reference_id)] = {
+            'formatted': formatted,
+            'accepted_at': time.time()
+        }
+        
+        # Save back to session
+        sessions.set(session_id, 'accepted_references', accepted_refs)
+        
+        print(f"[API] Accepted reference {reference_id} for session {session_id[:8]}")
+        
+        return jsonify({
+            'success': True,
+            'reference_id': reference_id
+        })
+        
+    except Exception as e:
+        print(f"[API] Error in /api/accept-reference: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/finalize-author-date', methods=['POST'])
+def finalize_author_date():
+    """
+    Finalize author-date document by appending References section.
+    
+    Called before download. Builds the document with all accepted references.
+    
+    Request JSON:
+    {
+        "session_id": "uuid",
+        "references": [
+            {"id": 1, "original": "(Smith, 2020)", "formatted": "Smith, J. (2020). Title..."},
+            ...
+        ]
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({
+                'success': False,
+                'error': 'Missing request data'
+            }), 400
+        
+        session_id = data.get('session_id')
+        references = data.get('references', [])
+        
+        if not session_id:
+            return jsonify({
+                'success': False,
+                'error': 'Missing session_id'
+            }), 400
+        
+        session_data = sessions.get(session_id)
+        
+        if not session_data:
+            return jsonify({
+                'success': False,
+                'error': 'Session not found or expired'
+            }), 404
+        
+        original_bytes = session_data.get('original_bytes')
+        
+        if not original_bytes:
+            return jsonify({
+                'success': False,
+                'error': 'Original document not found'
+            }), 404
+        
+        # If no references provided, try to get from accepted_references in session
+        if not references:
+            accepted_refs = session_data.get('accepted_references', {})
+            citations = session_data.get('citations', [])
+            
+            for cite in citations:
+                ref_id = str(cite.get('id', cite.get('note_id')))
+                if ref_id in accepted_refs:
+                    references.append({
+                        'id': ref_id,
+                        'original': cite.get('original', ''),
+                        'formatted': accepted_refs[ref_id].get('formatted', '')
+                    })
+        
+        # Generate document with References section
+        from io import BytesIO
+        import zipfile
+        import tempfile
+        import shutil
+        import xml.etree.ElementTree as ET
+        
+        temp_dir = tempfile.mkdtemp()
+        
+        try:
+            with zipfile.ZipFile(BytesIO(original_bytes), 'r') as zf:
+                zf.extractall(temp_dir)
+            
+            doc_path = os.path.join(temp_dir, 'word', 'document.xml')
+            
+            # Register namespaces
+            namespaces = {
+                'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main',
+                'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+            }
+            for prefix, uri in namespaces.items():
+                ET.register_namespace(prefix, uri)
+            
+            tree = ET.parse(doc_path)
+            root = tree.getroot()
+            body = root.find('.//w:body', namespaces)
+            
+            if body is not None:
+                sect_pr = body.find('w:sectPr', namespaces)
+                
+                # Create References heading
+                heading_para = ET.Element(f"{{{namespaces['w']}}}p")
+                heading_pPr = ET.SubElement(heading_para, f"{{{namespaces['w']}}}pPr")
+                heading_style = ET.SubElement(heading_pPr, f"{{{namespaces['w']}}}pStyle")
+                heading_style.set(f"{{{namespaces['w']}}}val", "Heading1")
+                heading_run = ET.SubElement(heading_para, f"{{{namespaces['w']}}}r")
+                heading_text = ET.SubElement(heading_run, f"{{{namespaces['w']}}}t")
+                heading_text.text = "References"
+                
+                # Add blank line
+                blank_para = ET.Element(f"{{{namespaces['w']}}}p")
+                
+                if sect_pr is not None:
+                    idx = list(body).index(sect_pr)
+                    body.insert(idx, heading_para)
+                    body.insert(idx + 1, blank_para)
+                else:
+                    body.append(heading_para)
+                    body.append(blank_para)
+                
+                # Sort references alphabetically by formatted text
+                sorted_refs = sorted(references, key=lambda r: r.get('formatted', '').lower())
+                
+                # Add each reference
+                for ref in sorted_refs:
+                    formatted = ref.get('formatted', ref.get('original', ''))
+                    if not formatted:
+                        continue
+                    
+                    ref_para = ET.Element(f"{{{namespaces['w']}}}p")
+                    
+                    # Hanging indent style
+                    ref_pPr = ET.SubElement(ref_para, f"{{{namespaces['w']}}}pPr")
+                    ref_ind = ET.SubElement(ref_pPr, f"{{{namespaces['w']}}}ind")
+                    ref_ind.set(f"{{{namespaces['w']}}}left", "720")
+                    ref_ind.set(f"{{{namespaces['w']}}}hanging", "720")
+                    
+                    # Parse for italics
+                    import re
+                    import html
+                    parts = re.split(r'(<i>.*?</i>)', html.unescape(formatted))
+                    
+                    for part in parts:
+                        if not part:
+                            continue
+                        
+                        run = ET.SubElement(ref_para, f"{{{namespaces['w']}}}r")
+                        
+                        italic_match = re.match(r'<i>(.*?)</i>', part)
+                        if italic_match:
+                            rPr = ET.SubElement(run, f"{{{namespaces['w']}}}rPr")
+                            ET.SubElement(rPr, f"{{{namespaces['w']}}}i")
+                            text_content = italic_match.group(1)
+                        else:
+                            text_content = part
+                        
+                        t = ET.SubElement(run, f"{{{namespaces['w']}}}t")
+                        t.text = text_content
+                        t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+                    
+                    if sect_pr is not None:
+                        idx = list(body).index(sect_pr)
+                        body.insert(idx, ref_para)
+                    else:
+                        body.append(ref_para)
+            
+            # Write modified document
+            tree.write(doc_path, encoding='UTF-8', xml_declaration=True)
+            
+            # Repackage docx
+            output_buffer = BytesIO()
+            with zipfile.ZipFile(output_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for root_dir, dirs, files in os.walk(temp_dir):
+                    for file in files:
+                        file_path = os.path.join(root_dir, file)
+                        arcname = os.path.relpath(file_path, temp_dir)
+                        zf.write(file_path, arcname)
+            
+            output_buffer.seek(0)
+            processed_bytes = output_buffer.read()
+            
+            # Save to session for download
+            sessions.set(session_id, 'processed_doc', processed_bytes)
+            
+            print(f"[API] Finalized author-date document with {len(references)} references")
+            
+            return jsonify({
+                'success': True,
+                'reference_count': len(references)
+            })
+            
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        
+    except Exception as e:
+        print(f"[API] Error in /api/finalize-author-date: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({
@@ -1102,89 +1504,6 @@ def select_citation():
         
     except Exception as e:
         print(f"[API] Error in /api/select-citation: {e}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-
-@app.route('/api/finalize-author-date', methods=['POST'])
-def finalize_author_date():
-    """
-    Finalize the author-date document with all selected citations.
-    
-    Request JSON:
-    {
-        "session_id": "uuid"
-    }
-    
-    Returns the processed document ready for download.
-    """
-    try:
-        data = request.get_json()
-        
-        if not data:
-            return jsonify({
-                'success': False,
-                'error': 'Missing request data'
-            }), 400
-        
-        session_id = data.get('session_id')
-        
-        if not session_id:
-            return jsonify({
-                'success': False,
-                'error': 'Missing session_id'
-            }), 400
-        
-        session_data = sessions.get(session_id)
-        if not session_data:
-            return jsonify({
-                'success': False,
-                'error': 'Session not found or expired'
-            }), 404
-        
-        original_bytes = session_data.get('original_bytes')
-        citations = session_data.get('citations', [])
-        
-        if not original_bytes:
-            return jsonify({
-                'success': False,
-                'error': 'Original document not found'
-            }), 404
-        
-        # Process the document with selected citations
-        from document_processor import WordDocumentProcessor
-        from io import BytesIO
-        
-        processor = WordDocumentProcessor(BytesIO(original_bytes))
-        
-        # Update each note with its selected citation
-        for citation in citations:
-            note_id = citation.get('note_id')
-            formatted = citation.get('formatted') or citation.get('original')
-            
-            if note_id and formatted:
-                # Try endnote first, then footnote
-                if not processor.write_endnote(note_id, formatted):
-                    processor.write_footnote(note_id, formatted)
-        
-        # Save to buffer
-        doc_buffer = processor.save_to_buffer()
-        processor.cleanup()
-        
-        # Store processed document
-        processed_bytes = doc_buffer.read()
-        sessions.set(session_id, 'processed_doc', processed_bytes)
-        
-        return jsonify({
-            'success': True,
-            'session_id': session_id,
-            'message': 'Document finalized successfully'
-        })
-        
-    except Exception as e:
-        print(f"[API] Error in /api/finalize-author-date: {e}")
         return jsonify({
             'success': False,
             'error': str(e)
